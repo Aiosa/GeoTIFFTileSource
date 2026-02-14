@@ -36,8 +36,10 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
    * @param {File|String|Object} input A File object, url string, or object with fields for pre-loaded GeoTIFF and GeoTIFFImages objects
    * @param {Object} opts Options object. To do: how to document options fields?
    *                 opts.logLatency: print latency to fetch and process each tile to console.log or the provided function
+   *                 opts.imagesFilter: array of indices to filter images by, or an array filter function to apply to the images array
    *                 opts.tileWidth: tileWidth to request at each level. Defaults to tileWidth specified by TIFF file or 256 if unspecified by the file
    *                 opts.tileHeight:tileWidth to request at each level. Defaults to tileWidth specified by TIFF file or 256 if unspecified by the file
+   *                 opts.GeoTIFFOptions Options object to pass to [geotiff.js]{@link https://github.com/geotiffjs/geotiff.js}
    *
    * @property {Object} GeoTIFF The GeoTIFF.js representation of the underlying file. Undefined until the file is opened successfully
    * @property {Array}  GeoTIFFImages Array of GeoTIFFImage objects, each representing one layer. Undefined until the file is opened successfully
@@ -92,7 +94,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
         this.setupLevels();
       } else {
         this.promises = {
-          GeoTIFF: input instanceof File ? fromBlob(input) : fromUrl(input),
+          GeoTIFF: input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions),
           GeoTIFFImages: new DeferredPromise(),
           ready: new DeferredPromise(),
         };
@@ -106,6 +108,8 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
             return Promise.all(promises);
           })
           .then((images) => {
+            images = self.constructor.userDefinedImagesFilter(images, opts);
+
             self.GeoTIFFImages = images;
             self.promises.GeoTIFFImages.resolve(images);
             this.setupLevels();
@@ -121,7 +125,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
       const fileExtension =
         input instanceof File ? input.name.split(".").pop() : input.split(".").pop();
 
-      let tiff = input instanceof File ? fromBlob(input) : fromUrl(input);
+      let tiff = input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions);
 
       return tiff
         .then((t) => {
@@ -132,6 +136,9 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
           Promise.all([...Array(c).keys()].map(async (index) => (await tiff).getImage(index)))
         )
         .then((images) => {
+          let tiff = input instanceof File ? fromBlob(input) : fromUrl(input);
+
+          images = this.userDefinedImagesFilter(images, opts);
           // Filter out images with photometricInterpretation.TransparencyMask
           images = images.filter(
             (image) =>
@@ -217,6 +224,19 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
           });
         });
     }
+    
+    static userDefinedImagesFilter = (images, opts) => {
+      if (typeof opts.imagesFilter !== 'undefined' && opts.imagesFilter) {
+        if (Array.isArray(opts.imagesFilter))
+          images = images.filter((_, idx) => opts.imagesFilter.includes(idx));
+        else if (typeof opts.imagesFilter === "function")
+          images = images.filter(opts.imagesFilter);
+
+        opts.imagesFilter = undefined;
+      }
+
+      return images;
+    };
 
     /**
      * Return the tileWidth for a given level.
@@ -470,7 +490,6 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
         return tiffRaster;
       });
     }
-
   }
 
   // Attach the class to the OpenSeadragon namespace

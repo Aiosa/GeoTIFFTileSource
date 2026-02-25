@@ -1,5 +1,6 @@
 import { fromBlob, fromUrl, globals, Pool } from "geotiff";
-import { DeferredPromise } from "./utils/DeferredPromise.js";
+import { PromiseWrapper } from "./utils/PromiseWrapper.js";
+import { logOnce } from "./utils/consoleOnce.js"
 import { parsePerkinElmerChannels } from "./formats/perkinElmer.js";
 import { installRawTiffPlugin } from "./formats/tiff.js";
 
@@ -10,8 +11,11 @@ import { installRawTiffPlugin } from "./formats/tiff.js";
  * Remote files require HTTP range requests to be enabled on the server.
  *
  * @param {OpenSeadragon} OpenSeadragon - The OpenSeadragon class.
+ * @param {Object} options - Options object.
+ * @param {String} options.workerUrl - URL of the worker script to use for GeoTIFF conversion. Defaults to the worker script bundled with this library.
+ * @param {Object} options.workerPool - Worker pool to use for GeoTIFF conversion. Defaults to a new pool created for this instance.
  */
-export const enableGeoTIFFTileSource = (OpenSeadragon) => {
+export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
 
   if (OpenSeadragon.version.major < 4 || (OpenSeadragon.version.major === 4 && OpenSeadragon.version.minor < 1)) {
     // This class uses downloadTileStart API added in OSD v 4.1
@@ -19,13 +23,34 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
     throw new Error("Your current OpenSeadragon version is too low to support GeoTIFFTileSource");
   }
 
+  const {
+    workerUrl,     // optional: string or URL
+    workerPool,    // optional: { createWorker: () => Worker }
+  } = options;
+
+  const defaultCreateWorker = () => {
+    // If caller passed a specific URL, use it directly
+    if (workerUrl) {
+      // workerUrl can be a string or URL object
+      return new Worker(workerUrl, { type: "module" });
+    }
+
+    // Fallback: original behavior – worker lives in ./formats/ next to this file
+    return new Worker(new URL("./formats/tiff.worker.js", import.meta.url), {
+      type: "module",
+    });
+  };
+
   // Ensure RawTIFF converter plugin is installed (works on both OSD v6+ and legacy versions).
   // For OSD v6+ it registers DataTypeConverter edges; for older versions we call the API manually.
+  const effectiveWorkerPool =
+    workerPool || {
+      createWorker: defaultCreateWorker,
+    };
+
+  // Ensure RawTIFF converter plugin is installed.
   const RawTiffAPI = OpenSeadragon.RawTiffPlugin || installRawTiffPlugin(OpenSeadragon, {
-    workerPool: {
-      // If your bundler cannot resolve this URL, pass a custom createWorker here.
-      createWorker: () => new Worker(new URL("./formats/tiff.worker.js", import.meta.url), { type: "module" }),
-    },
+    workerPool: effectiveWorkerPool,
   });
 
   let tsCounter = 0;
@@ -85,7 +110,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
         this.promises = {
           GeoTIFF: Promise.resolve(input.GeoTIFF),
           GeoTIFFImages: Promise.resolve(input.GeoTIFFImages),
-          ready: new DeferredPromise(),
+          ready: new PromiseWrapper(),
         };
         this.GeoTIFF = input.GeoTIFF;
         this.imageCount = input.GeoTIFFImages.length;
@@ -95,8 +120,8 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
       } else {
         this.promises = {
           GeoTIFF: input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions),
-          GeoTIFFImages: new DeferredPromise(),
-          ready: new DeferredPromise(),
+          GeoTIFFImages: new PromiseWrapper(),
+          ready: new PromiseWrapper(),
         };
         this.promises.GeoTIFF.then((tiff) => {
           self.GeoTIFF = tiff;
@@ -125,67 +150,97 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
       const fileExtension =
         input instanceof File ? input.name.split(".").pop() : input.split(".").pop();
 
-      let tiff = input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions);
+      let tiff = await (
+        input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions)
+      );
+      let imageCount = await tiff.getImageCount();
 
-      return tiff
-        .then((t) => {
-          tiff = t;
-          return t.getImageCount();
-        })
-        .then((c) =>
-          Promise.all([...Array(c).keys()].map(async (index) => (await tiff).getImage(index)))
-        )
-        .then((images) => {
-          let tiff = input instanceof File ? fromBlob(input) : fromUrl(input);
+      return Promise.all(
+        Array.from({ length: imageCount }, (_, i) => tiff.getImage(i))
+      ).then((images) => {
+        let tiff = input instanceof File ? fromBlob(input) : fromUrl(input);
 
-          images = this.userDefinedImagesFilter(images, opts);
-          // Filter out images with photometricInterpretation.TransparencyMask
-          images = images.filter(
-            (image) =>
-              image.fileDirectory.photometricInterpretation !==
-              globals.photometricInterpretations.TransparencyMask
+        images = this.userDefinedImagesFilter(images, opts);
+        // Filter out images with photometricInterpretation.TransparencyMask
+        images = images.filter(
+          (image) =>
+            image.fileDirectory.photometricInterpretation !==
+            globals.photometricInterpretations.TransparencyMask
+        );
+
+        // Layout of images can vary -> images form pyramids, or all images are bases of pyramids
+        // while they have ref to sub-levels, or they are not pyramids at all
+        return this.resolveLayout(tiff, images, opts.hints);
+      }).then((layout) => {
+        return this.buildLevelImages(tiff, layout, tiff);
+      }).then((images) => {
+        // Sort by width (largest first), then detect pyramids
+        images.sort((a, b) => b.getWidth() - a.getWidth());
+
+        // find unique aspect ratios (with tolerance to account for rounding)
+        const tolerance = 0.015;
+
+        // Organize images into sets based on aspect ratio as well as
+        // macro thumbnails and labels according to the Aperio SVS format:
+        //   https://web.archive.org/web/20120420105738/http://www.aperio.com/documents/api/Aperio_Digital_Slides_and_Third-party_data_interchange.pdf (pg 14)
+        const aspectRatioSets = images.reduce((accumulator, image) => {
+          const r = image.getWidth() / image.getHeight();
+          let s = ""; // Initialize with no description
+
+          // Check whether the ImageDescription exists as a field just in case
+          if (image.fileDirectory.ImageDescription){
+            // Split out part of the description that signifies its type for identification
+            s = image.fileDirectory.ImageDescription.split("\n")[1] ?? "";
+          }
+
+          const exists = accumulator.filter(
+            (set) => ((Math.abs(1 - set.aspectRatio / r) < tolerance)
+              && !(s?.includes("macro") || s?.includes("label"))) // Separate out macro thumbnails and labels
           );
+          if (exists.length === 0) {
+            let set = {
+              aspectRatio: r,
+              images: [image],
+            };
+            accumulator.push(set);
+          } else {
+            exists[0].images.push(image);
+          }
+          return accumulator;
+        }, []);
 
-          // Sort by width (largest first), then detect pyramids
-          images.sort((a, b) => b.getWidth() - a.getWidth());
+        const imageSets = aspectRatioSets.map((set) => set.images);
 
-          // find unique aspect ratios (with tolerance to account for rounding)
-          const tolerance = 0.015;
-
-          // Organize images into sets based on aspect ratio as well as
-          // macro thumbnails and labels according to the Aperio SVS format:
-          //   https://web.archive.org/web/20120420105738/http://www.aperio.com/documents/api/Aperio_Digital_Slides_and_Third-party_data_interchange.pdf (pg 14)
-          const aspectRatioSets = images.reduce((accumulator, image) => {
-            const r = image.getWidth() / image.getHeight();
-            let s = ""; // Initialize with no description
-
-            // Check whether the ImageDescription exists as a field just in case
-            if (image.fileDirectory.ImageDescription){
-              // Split out part of the description that signifies its type for identification
-              s = image.fileDirectory.ImageDescription.split("\n")[1] ?? "";
-            }
-
-            const exists = accumulator.filter(
-              (set) => ((Math.abs(1 - set.aspectRatio / r) < tolerance)
-                && !(s?.includes("macro") || s?.includes("label"))) // Separate out macro thumbnails and labels
+        return imageSets.map((images, index) => {
+          // Check if QPTIFF
+          if (index !== 0) {
+            return new OpenSeadragon.GeoTIFFTileSource(
+              {
+                GeoTIFF: tiff,
+                GeoTIFFImages: images,
+              },
+              opts
             );
-            if (exists.length === 0) {
-              let set = {
-                aspectRatio: r,
-                images: [image],
-              };
-              accumulator.push(set);
-            } else {
-              exists[0].images.push(image);
-            }
-            return accumulator;
-          }, []);
+          }
 
-          const imageSets = aspectRatioSets.map((set) => set.images);
+          switch (fileExtension) {
+            case "qptiff":
+              const channels = parsePerkinElmerChannels(images);
+              return Array.from(channels.values()).map((channel, index) => {
+                return new OpenSeadragon.GeoTIFFTileSource(
+                  {
+                    GeoTIFF: tiff,
+                    GeoTIFFImages: channel.images,
+                    channel: {
+                      name: channel.name,
+                      color: channel.color,
+                    },
+                  },
+                  opts
+                );
+              });
 
-          return imageSets.map((images, index) => {
-            // Check if QPTIFF
-            if (index !== 0) {
+            default:
               return new OpenSeadragon.GeoTIFFTileSource(
                 {
                   GeoTIFF: tiff,
@@ -193,36 +248,9 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
                 },
                 opts
               );
-            }
-
-            switch (fileExtension) {
-              case "qptiff":
-                const channels = parsePerkinElmerChannels(images);
-                return Array.from(channels.values()).map((channel, index) => {
-                  return new OpenSeadragon.GeoTIFFTileSource(
-                    {
-                      GeoTIFF: tiff,
-                      GeoTIFFImages: channel.images,
-                      channel: {
-                        name: channel.name,
-                        color: channel.color,
-                      },
-                    },
-                    opts
-                  );
-                });
-
-              default:
-                return new OpenSeadragon.GeoTIFFTileSource(
-                  {
-                    GeoTIFF: tiff,
-                    GeoTIFFImages: images,
-                  },
-                  opts
-                );
-            }
-          });
+          }
         });
+      });
     }
     
     static userDefinedImagesFilter = (images, opts) => {
@@ -426,6 +454,146 @@ export const enableGeoTIFFTileSource = (OpenSeadragon) => {
       this.setupComplete();
     }
 
+    static getGeoTiffFileDirectory(geoTiffFile) {
+      return geoTiffFile.getFileDirectory?.() ?? geoTiffFile.fileDirectory ?? {};
+    }
+
+    static getGeoTiffFileKey(geoTiffFile) {
+      return [
+        geoTiffFile.getWidth(), geoTiffFile.getHeight(),
+        (this.getGeoTiffFileDirectory(geoTiffFile).TileWidth ?? 0),
+        (this.getGeoTiffFileDirectory(geoTiffFile).TileLength ?? 0),
+        (geoTiffFile.getWidth()/geoTiffFile.getHeight()).toFixed(6)
+      ].join("|");
+    }
+
+    static async resolveLayout(tiff, allTopImages, hints = {}) {
+      const cfg = hints.layout || {};
+      const pyramidPref = cfg.pyramid || "auto"; // "auto"|"ifd"|"subifd"
+      const planeIndex = Number.isFinite(cfg.planeIndex) ? cfg.planeIndex : 0;
+
+      // 1) Partition by size/tile shape
+      const groups = new Map(); // key -> GeoTIFFImage[]
+      for (const img of allTopImages) {
+        const key = this.getGeoTiffFileKey(img);
+        img.__key = key;
+        const f = this.getGeoTiffFileDirectory(img);
+        const arr = groups.get(key) || [];
+        arr.push(img);
+        groups.set(key, arr);
+      }
+
+      const topSizes = allTopImages
+        .map(im => ({ im, w: im.getWidth(), h: im.getHeight() }))
+        .sort((a,b)=> b.w - a.w);
+
+      // 2) Detect sequential IFD pyramid candidate:
+      // sort unique sizes descending; if there are >=2 and roughly halving and same aspect
+      const uniqueBySize = [];
+      const seen = new Set();
+      for (const {im,w,h} of topSizes) {
+        const k = `${w}x${h}`;
+        if (!seen.has(k)) { seen.add(k); uniqueBySize.push(im); }
+      }
+      const looksIFDPyramid = (imgs) => {
+        if (imgs.length < 2) return false;
+        // check monotonic decreasing
+        for (let i=1;i<imgs.length;i++){
+          if (imgs[i].getWidth() >= imgs[i-1].getWidth()) return false;
+          if (imgs[i].getHeight() >= imgs[i-1].getHeight()) return false;
+        }
+        // check aspect ratio consistency (loose)
+        const r0 = imgs[0].getWidth()/imgs[0].getHeight();
+        for (const im of imgs) {
+          const r = im.getWidth()/im.getHeight();
+          if (Math.abs(r-r0) > 0.01) return false;
+        }
+        return true;
+      };
+
+      // Candidate “levels” from top-level IFDs:
+      const ifdLevelsLargestToSmallest = uniqueBySize; // already desc
+      const ifdPyramidOk = looksIFDPyramid(ifdLevelsLargestToSmallest);
+
+      // 3) Detect SubIFD pyramid presence
+      const anyHasSubIFD = allTopImages.some(im => {
+        const sub = this.getGeoTiffFileDirectory(im).SubIFDs;
+        return sub && sub.length;
+      });
+
+      // 4) Choose pyramid strategy
+      let strategy = "single"; // "ifd"|"subifd"|"single"
+      if (pyramidPref === "ifd") strategy = ifdPyramidOk ? "ifd" : "single";
+      else if (pyramidPref === "subifd") strategy = anyHasSubIFD ? "subifd" : "single";
+      else {
+        // auto
+        if (ifdPyramidOk) strategy = "ifd";
+        else if (anyHasSubIFD) strategy = "subifd";
+        else strategy = "single";
+      }
+
+      // 5) Planes/stack detection: multiple same-sized top-level IFDs
+      // Choose the “largest size group” as the base stack
+      const largest = ifdLevelsLargestToSmallest[0];
+      const largestKey = largest.__key;
+      const planes = groups.get(largestKey) || [largest];
+
+      // todo: the selection should warn if planeIndex is out, support getter for index selection (since the index
+      //   might not be known apriori so it is hard to send it as argument, and warn if we cannot use the index for
+      //   some reason
+      const chosenPlane = planes[Math.max(0, Math.min(planes.length - 1, planeIndex))];
+
+      if (strategy === "subifd") {
+        logOnce(`${chosenPlane.__key}-subifd-warn`, `[GeoTIFFTileSource] File was detected to contain SubIFD pyramids, 
+however, geotiff.js does not support reading SubIFD files and is unable to display the pyramid. Only the
+high-resolution lowest level will be shown`, 'warn');
+        strategy = "ifd";
+      }
+
+      return { strategy, planes, chosenPlane, ifdLevelsLargestToSmallest };
+    }
+
+    static async buildLevelImages(tiff, layout, warnKey) {
+      const { strategy, chosenPlane, ifdLevelsLargestToSmallest, planes } = layout;
+      const fd = (img) => img.getFileDirectory?.() ?? img.fileDirectory ?? {};
+
+      if (strategy === "ifd") {
+        // OSD expects levels from smallest->largest usually; your code may use opposite
+        const levels = [...ifdLevelsLargestToSmallest].sort((a,b)=> a.getWidth()-b.getWidth());
+        if (planes.length > 1) {
+          logOnce(warnKey, `[GeoTIFFTileSource] Detected a plane stack (${planes.length} same-size IFDs) AND a top-level pyramid. Defaulting to planeIndex=0. Set hints.layout.planeIndex to choose a different plane.`, 'warn');
+        }
+        return levels;
+      }
+
+      if (strategy === "subifd") {
+        const f = fd(chosenPlane);
+        const sub = f.SubIFDs;
+        if (!sub || !sub.length) {
+          logOnce(warnKey, `[GeoTIFFTileSource] SubIFD pyramid requested/detected but the chosen plane has no SubIFDs. Falling back to single level.`, 'warn');
+          return [chosenPlane];
+        }
+
+        // Prefer geotiff.js public API if present
+        if (typeof chosenPlane.getSubIFDs === "function") {
+          const subs = await chosenPlane.getSubIFDs();
+          const levels = [...subs, chosenPlane].sort((a,b)=> a.getWidth()-b.getWidth());
+          if (planes.length > 1) {
+            logOnce(warnKey, `[GeoTIFFTileSource] Detected a plane stack (${planes.length} same-size IFDs) with SubIFD pyramid. Defaulting to planeIndex=0. Set hints.layout.planeIndex to choose plane.`, 'warn');
+          }
+          return levels;
+        }
+
+        logOnce(warnKey, `[GeoTIFFTileSource] SubIFDs are present but geotiff.js does not expose getSubIFDs() in this build. Using single level. (You can still render multi-plane data via your GPU pipeline.)`, 'warn');
+        return [chosenPlane];
+      }
+
+      // single level
+      if (planes.length > 1) {
+        logOnce(warnKey, `[GeoTIFFTileSource] Detected ${planes.length} same-size IFD pages (likely channels/planes). No pyramid detected. Defaulting to planeIndex=0. Set hints.layout.planeIndex to choose plane.`, 'warn');
+      }
+      return [chosenPlane];
+    }
 
     regionToTiffRaster(level, x, y, abortSignal) {
       const startTime = this.options.logLatency && Date.now();

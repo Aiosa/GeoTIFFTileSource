@@ -1,4 +1,4 @@
-import { fromBlob, fromUrl, globals, Pool } from "geotiff";
+import { fromBlob, fromUrl, fromCustomClient, BaseClient, BaseResponse, globals, Pool } from "geotiff";
 import { PromiseWrapper } from "./utils/PromiseWrapper.js";
 import { logOnce } from "./utils/consoleOnce.js"
 import { parsePerkinElmerChannels } from "./formats/perkinElmer.js";
@@ -16,6 +16,7 @@ window.GeoTIFF = gtiff;
  * @param {Object} options - Options object.
  * @param {String} options.workerUrl - URL of the worker script to use for GeoTIFF conversion. Defaults to the worker script bundled with this library.
  * @param {Object} options.workerPool - Worker pool to use for GeoTIFF conversion. Defaults to a new pool created for this instance.
+ * @param {Object} [options.httpAdapter] - Optional HTTP adapter for routing all geotiff.js range requests through a custom transport (auth, proxy, retry). Shape: `{ fetch(url, init?) => Promise<Response> }`. When omitted, geotiff.js uses the global `fetch`.
  */
 export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
 
@@ -28,7 +29,30 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
   const {
     workerUrl,     // optional: string or URL
     workerPool,    // optional: { createWorker: () => Worker }
+    httpAdapter,   // optional: { fetch(url, init?) => Promise<Response> }
   } = options;
+
+  const AdapterClientCtor = httpAdapter
+    ? (() => {
+        class AdapterResponse extends BaseResponse {
+          constructor(res) { super(); this.res = res; }
+          get status()    { return this.res.status; }
+          getHeader(name) { return this.res.headers.get(name); }
+          async getData() { return this.res.arrayBuffer(); }
+        }
+        return class AdapterClient extends BaseClient {
+          async request({ headers, signal } = {}) {
+            const res = await httpAdapter.fetch(this.url, { headers, signal });
+            return new AdapterResponse(res);
+          }
+        };
+      })()
+    : null;
+
+  const openRemote = (url, geotiffOptions) =>
+    AdapterClientCtor
+      ? fromCustomClient(new AdapterClientCtor(url), geotiffOptions)
+      : fromUrl(url, geotiffOptions);
 
   const defaultCreateWorker = () => {
     // If caller passed a specific URL, use it directly
@@ -121,7 +145,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
         this.setupLevels();
       } else {
         this.promises = {
-          GeoTIFF: input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions),
+          GeoTIFF: input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : openRemote(input, opts.GeoTIFFOptions),
           GeoTIFFImages: new PromiseWrapper(),
           ready: new PromiseWrapper(),
         };
@@ -153,7 +177,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
         input instanceof File ? input.name.split(".").pop() : input.split(".").pop();
 
       let tiff = await (
-        input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : fromUrl(input, opts.GeoTIFFOptions)
+        input instanceof File ? fromBlob(input, opts.GeoTIFFOptions) : openRemote(input, opts.GeoTIFFOptions)
       );
       let imageCount = await tiff.getImageCount();
 

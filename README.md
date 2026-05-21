@@ -77,6 +77,41 @@ enableGeoTIFFTileSource(OpenSeadragon, { /* optional config */ });
 
 This will make the `OpenSeadragon.GeoTIFFTileSource` class available for use.
 
+### `enableGeoTIFFTileSource` options
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `workerUrl` | `string \| URL` | URL of the worker script used for GeoTIFF decoding. Defaults to the worker bundled with this library. |
+| `workerPool` | `{ createWorker: () => Worker }` | Custom worker pool. Defaults to a pool that uses `workerUrl`. |
+| `httpAdapter` | `{ fetch(url, init?) => Promise<Response> }` | Optional HTTP adapter routing **all** geotiff.js range requests through a custom transport. See below. |
+
+### Custom HTTP transport (`httpAdapter`)
+
+By default, geotiff.js issues range requests through the global `fetch`. If you need to route every request through your own transport — for JWT auth, CSRF tokens, proxy aliasing, retry, abort plumbing, etc. — pass an `httpAdapter`. Its `fetch` is invoked for every byte-range request geotiff.js makes (header probe + tile slices), with the `Range` header already set:
+
+```javascript
+enableGeoTIFFTileSource(OpenSeadragon, {
+  httpAdapter: {
+    async fetch(url, init) {
+      // init.headers includes the Range header set by geotiff.js
+      // init.signal is the AbortSignal — forward it to support cancellation
+      return fetch(url, {
+        ...init,
+        credentials: "include",
+        headers: { ...init.headers, Authorization: `Bearer ${token}` },
+      });
+    },
+  },
+});
+```
+
+Requirements for the returned `Response`:
+- Status `206` with a `Content-Range: bytes <start>-<end>/<total>` header for partial responses (the typical case).
+- Status `200` with the full body when the server doesn't honor ranges (only works if `GeoTIFFOptions.allowFullFile: true` is set on the tile source).
+- Standard `Response` semantics — `arrayBuffer()` and `headers.get()` must work.
+
+When omitted, behavior is byte-identical to previous versions (geotiff.js's default `fetch` path).
+
 ## Usage
 The plugin can be used in two ways:
  - using GeoTIFFTileSource directly to open GeoTIFF files to read tiff files

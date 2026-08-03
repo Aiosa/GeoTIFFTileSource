@@ -58,16 +58,34 @@ export default defineConfig(({ mode }) => {
     ],
 
     test: {
-      environment: "jsdom",
-      browser: {
-        enabled: true,
-        provider: playwright(),
-        instances: [
-          {
-            browser: "chromium",
+      projects: [
+        {
+          test: {
+            name: "layout-jsdom",
+            environment: "jsdom",
+            setupFiles: ["test/polyfills/worker.js"],
+            browser: { enabled: false },
+            include: ["test/pyramid-layout.test.js"],
           },
-        ],
-      },
+        },
+        {
+          test: {
+            name: "browser",
+            environment: "jsdom",
+            // No worker polyfill here: Chromium has a real Worker, and the polyfill's
+            // node:worker_threads import fails to load in the browser.
+            browser: {
+              enabled: true,
+              provider: playwright(),
+              instances: [{ browser: "chromium" }],
+            },
+            // Everything except the jsdom-only layout suite, so a new test file is not
+            // silently skipped by an out-of-date list.
+            include: ["test/**/*.test.js"],
+            exclude: ["test/pyramid-layout.test.js"],
+          },
+        },
+      ],
     },
   };
 });

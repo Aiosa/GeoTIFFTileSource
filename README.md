@@ -4,6 +4,26 @@ Implementation of a [TileSource](https://openseadragon.github.io/docs/OpenSeadra
 
 See it in action at [https://pearcetm.github.io/GeoTIFFTileSource/demo/demo.html](https://pearcetm.github.io/GeoTIFFTileSource/demo/demo.html)
 
+## Local demo development (before pushing to GitHub Pages)
+
+The demo pages live under [`demo/`](demo/) and are served locally via Vite.
+
+```bash
+npm ci
+npm run dev
+```
+
+Vite will open [`/demo/demo.html`](demo/demo.html). The GitHub Pages version of that page loads the library from `dist/`, so before pushing changes that affect the library bundle, run:
+
+```bash
+npm run build
+```
+
+### Optional screenshot overlay (osd-paperjs-annotation)
+
+The main demo supports an opt-in screenshot overlay. Enable it by adding a query param:
+- `demo/demo.html?screenshot` (or `?screenshot=1`)
+
 ## How to create GeoTIFF files
 
 In order to generate a GeoTIFF file compatible with this library, you can for instance use [sharp](https://sharp.pixelplumbing.com/), a *High performance Node.js image processing* library.
@@ -122,7 +142,12 @@ The plugin can be used in two ways:
 
 #### Prepare TileSources
 
-GeoTIFFTileSource accepts both local and remote GeoTIFF files. For local files, the `url` parameter should be a `File` object. For remote files, the `url` parameter should be a string. The `getAllTileSources` reads a local or remote GeoTIFF file and returns an array of `OpenSeadragon.GeoTIFFTileSource` objects, one for each image (page) in the GeoTIFF file.
+GeoTIFFTileSource accepts both local and remote GeoTIFF files. For local files, the `url` parameter should be a `File` object. For remote files, the `url` parameter should be a string. The `getAllTileSources` reads a local or remote GeoTIFF file and returns an array of `OpenSeadragon.GeoTIFFTileSource` objects (typically one primary slide plus separate sources for other aspect ratios, e.g. Aperio macro/label).
+
+Each tile source exposes:
+
+- **`GeoTIFFImages`**: pages used as OpenSeadragon pyramid levels (what `setupLevels` reads).
+- **`GeoTIFFAllImages`**: every page in that source’s aspect-ratio group (same as `GeoTIFFImages` if you construct the source yourself without the split). Use this for **metadata / file listings** so companion pages are still visible when `GeoTIFFImages` is level-only.
 You can optionally pass an `options` object to `getAllTileSources` to control the behavior of the library. 
 ``options.GeoTiffOptions`` are passed to geotiff.js, and ``options.hints`` are passed to the library.
 ```javascript
@@ -329,7 +354,7 @@ Layout hints control how the tile source chooses pyramid levels and plane select
 #### `hints.layout.pyramid`
 `"auto" | "ifd" | "subifd"` (default `"auto"`)
 
-- `"auto"`: choose based on detected structure
+- `"auto"`: choose based on detected structure. For formats like **Aperio SVS**, macro/label IFDs are excluded from pyramid detection so the main slide’s IFD pyramid is still recognized when those companions share a similar aspect ratio.
 - `"ifd"`: force pyramid from top-level IFD pages
 - `"subifd"`: force pyramid from SubIFDs if present
 
@@ -341,8 +366,19 @@ If the file is a plane/channel stack (multiple same-size IFDs), choose which pla
 #### `hints.layout.prefer`
 `"pyramid" | "stack"` (default `"pyramid"`)
 
-If the file is ambiguous, choose which interpretation to prefer.
+When the largest resolution has **multiple same-size IFDs** (planes/channels) and the file would otherwise be treated as an IFD pyramid including overview levels:
+
+- **`"pyramid"`** (default): keep IFD pyramid behavior (overviews as levels; use `planeIndex` to pick which full-resolution plane).
+- **`"stack"`**: treat as a **single-level** source for the chosen `planeIndex` only (no pyramid from overview IFDs).
 
 ### Warnings about defaults
 
 If the library has to guess (e.g. plane stack without explicit `planeIndex`, or ambiguous 4-channel data), it will emit a **console warning once** explaining what default was chosen and how to override it via options.
+
+## Tests
+
+`npm test` runs Vitest with two projects: **layout** tests in Node/jsdom (no browser), and **browser** tests (RawTIFF / converter) under Chromium via Playwright. Install browsers once if needed:
+
+```bash
+npx playwright install chromium
+```

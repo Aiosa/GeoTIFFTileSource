@@ -14,6 +14,18 @@
 
 import { fromArrayBuffer } from "geotiff";
 import { Converters } from "../utils/Converters.js";
+import {
+  PHOTOMETRIC,
+  SAMPLE_ENCODING_VERSION,
+  SAMPLE_FORMAT,
+  channelEncodingAt,
+  inferInterpretation,
+  isDisplayReadyChannel,
+  readSampleRangeTags,
+  resolveSampleEncoding,
+  sampleToByte,
+  sampleToUnit,
+} from "../utils/tiffEncoding.js";
 
 // Tests in node have no self.
 const workerRef = self || globalThis;
@@ -27,16 +39,7 @@ function workerWarn(code, message) {
 }
 
 // Photometric interpretation constants (matching TIFF spec / geotiff.js)
-const PI = {
-  WhiteIsZero: 0,
-  BlackIsZero: 1,
-  RGB: 2,
-  Palette: 3,
-  TransparencyMask: 4,
-  CMYK: 5,
-  YCbCr: 6,
-  CIELab: 8,
-};
+const PI = PHOTOMETRIC;
 
 function errorToPlain(err) {
   try {
@@ -89,30 +92,44 @@ function reviveBands(descs) {
   });
 }
 
-function inferFromTIFFTags(raster) {
-  const spp = raster.samplesPerPixel || (raster.bands ? raster.bands.length : 1);
-  const pi = raster.photometricInterpretation;
+/**
+ * Declared sample encoding of a raster, resolved once and cached on the raster copy.
+ * @param {Object} raster
+ * @returns {import("../utils/tiffEncoding.js").SampleEncoding}
+ */
+function rasterEncoding(raster) {
+  if (raster.__encoding) return raster.__encoding;
 
-  // If photometric clearly implies an image, treat as image.
-  if (
-    pi === PI.RGB ||
-    pi === PI.YCbCr ||
-    pi === PI.CMYK ||
-    pi === PI.CIELab ||
-    pi === PI.Palette
-  ) {
-    return "image";
-  }
+  const { sMinSampleValue, sMaxSampleValue } = readSampleRangeTags(raster.fileDirectory);
+  const encoding = resolveSampleEncoding({
+    bitsPerSample: raster.bitsPerSample,
+    sampleFormat: raster.sampleFormat,
+    sMinSampleValue,
+    sMaxSampleValue,
+    samplesPerPixel: Math.max(
+      raster.samplesPerPixel || 0,
+      raster.bands ? raster.bands.length : 0
+    ),
+  });
+  raster.__encoding = encoding;
+  return encoding;
+}
 
-  // Grayscale "image" case
-  // todo: consider still outputing as data to save space (this forces RGBA expansion, although but the expansion
-  //  happens sooner or later, systems that directly render the data might e.g. avoid passing the expanded bands to gpu)
-  if ((pi === PI.BlackIsZero || pi === PI.WhiteIsZero) && spp === 1) {
-    return "image";
-  }
+/**
+ * Image-vs-data classification. Delegates to the shared rule so the worker, the
+ * main-thread renderer and the tile source cannot disagree about the same file.
+ */
+function inferFromTIFFTags(raster, format) {
+  const selected = format && Array.isArray(format.channels) && format.channels.length
+    ? format.channels
+    : null;
 
-  // Default to data for unknown PI.
-  return "data";
+  return inferInterpretation({
+    photometricInterpretation: raster.photometricInterpretation,
+    samplesPerPixel: raster.samplesPerPixel || (raster.bands ? raster.bands.length : 1),
+    hasColorMap: !!raster.colorMap,
+    encoding: rasterEncoding(raster),
+  }, selected);
 }
 
 /**
@@ -171,12 +188,29 @@ function resolveFormatFromHints(hints) {
  *  - optional format.image.rgbaChannels override
  *  - optional hints.renderChannels override
  *
- * NOTE: This worker version is intentionally "display-oriented" and assumes 8-bit-ish
- * for image-mode. Precision-focused packing happens after this if RGBA16F is requested.
+ * NOTE: This worker version is intentionally "display-oriented": every sample is mapped
+ * to a display byte through the declared sample encoding, so a >8-bit plane forced down
+ * this path is rescaled rather than truncated. Precision-focused packing happens after
+ * this if RGBA16F is requested.
  */
 function rasterToRGBA8_ImageMode(raster, hints, format) {
   const spp = raster.samplesPerPixel || (raster.bands ? raster.bands.length : 1);
   const photometric = raster.photometricInterpretation;
+  const encoding = rasterEncoding(raster);
+
+  // Display bytes for one band. 8-bit integer bands are passed through untouched.
+  const bandBytes = (bandIndex) => {
+    const band = raster.bands[bandIndex];
+    if (!band) return null;
+    const ch = channelEncodingAt(encoding, bandIndex);
+    if (isDisplayReadyChannel(ch) &&
+        (band instanceof Uint8Array || band instanceof Uint8ClampedArray)) {
+      return band;
+    }
+    const out = new Uint8ClampedArray(band.length);
+    for (let i = 0; i < band.length; i++) out[i] = sampleToByte(band[i], ch);
+    return out;
+  };
 
   // Channel override precedence:
   // format.image.rgbaChannels > hints.renderChannels > default behavior
@@ -203,11 +237,9 @@ function rasterToRGBA8_ImageMode(raster, hints, format) {
 
   // WhiteIsZero / BlackIsZero
   if ((photometric === PI.WhiteIsZero || photometric === PI.BlackIsZero) && spp >= 1) {
-    const band0 = raster.bands[0];
-    const bits = raster.bitsPerSample && raster.bitsPerSample[0] != null ? raster.bitsPerSample[0] : 8;
-    const max = Math.pow(2, bits) - 1;
-    if (photometric === PI.WhiteIsZero) return Converters.RGBAfromWhiteIsZero(band0, max);
-    return Converters.RGBAfromBlackIsZero(band0, max);
+    const gray = bandBytes(0);
+    if (photometric === PI.WhiteIsZero) return Converters.RGBAfromWhiteIsZero(gray, 255);
+    return Converters.RGBAfromBlackIsZero(gray, 255);
   }
 
   // If explicit channel mapping exists, use it (planar -> interleaved -> RGBA)
@@ -217,21 +249,20 @@ function rasterToRGBA8_ImageMode(raster, hints, format) {
     const pixelCount = width * height;
 
     if (channels.length === 1) {
-      const b0 = raster.bands[channels[0]];
-      const bits = raster.bitsPerSample && raster.bitsPerSample[channels[0]] != null ? raster.bitsPerSample[channels[0]] : 8;
-      const max = Math.pow(2, bits) - 1;
       // treat as black-is-zero for visualization
-      return Converters.RGBAfromBlackIsZero(b0, max);
+      return Converters.RGBAfromBlackIsZero(bandBytes(channels[0]), 255);
     }
 
-    // build interleaved tmp bytes by simple clamping (best-effort)
+    // build interleaved display bytes through the declared encoding
     const tmp = new Uint8ClampedArray(pixelCount * channels.length);
+    const chEnc = channels.map((bi) => channelEncodingAt(encoding, bi));
     for (let i = 0; i < pixelCount; i++) {
       const base = i * channels.length;
       for (let c = 0; c < channels.length; c++) {
         const bi = channels[c];
-        const v = (bi != null && bi >= 0 && bi < raster.bands.length) ? raster.bands[bi][i] : 0;
-        tmp[base + c] = v;
+        tmp[base + c] = (bi != null && bi >= 0 && bi < raster.bands.length)
+          ? sampleToByte(raster.bands[bi][i], chEnc[c])
+          : 0;
       }
     }
 
@@ -256,50 +287,45 @@ function rasterToRGBA8_ImageMode(raster, hints, format) {
     return out;
   }
 
-  // RGB / YCbCr / CMYK / Lab defaults
+  // RGB / YCbCr / CMYK / Lab defaults. Bands are rescaled to display bytes first, so a
+  // >8-bit plane forced down this path does not saturate in the Uint8ClampedArray copy.
   if (photometric === PI.RGB && spp >= 3) {
-    const r = raster.bands[0];
-    const g = raster.bands[1];
-    const b = raster.bands[2];
-    const a = spp >= 4 ? raster.bands[3] : null;
-    return Converters.RGBAfromRGB(r, g, b, a);
+    return Converters.RGBAfromRGB(
+      bandBytes(0), bandBytes(1), bandBytes(2), spp >= 4 ? bandBytes(3) : null
+    );
   }
 
   if (photometric === PI.YCbCr && spp >= 3) {
-    const y = raster.bands[0];
-    const cb = raster.bands[1];
-    const cr = raster.bands[2];
-    return Converters.RGBAfromYCbCr(y, cb, cr);
+    return Converters.RGBAfromYCbCr(bandBytes(0), bandBytes(1), bandBytes(2));
   }
 
   if (photometric === PI.CMYK && spp >= 4) {
-    const c = raster.bands[0];
-    const m = raster.bands[1];
-    const y = raster.bands[2];
-    const k = raster.bands[3];
-    return Converters.RGBAfromCMYK(c, m, y, k);
+    return Converters.RGBAfromCMYK(bandBytes(0), bandBytes(1), bandBytes(2), bandBytes(3));
   }
 
   if (photometric === PI.CIELab && spp >= 3) {
-    const l = raster.bands[0];
-    const a = raster.bands[1];
-    const b = raster.bands[2];
-    return Converters.RGBAfromCIELab(l, a, b);
+    return Converters.RGBAfromCIELab(bandBytes(0), bandBytes(1), bandBytes(2));
   }
 
   // Fallback grayscale
-  const band0 = raster.bands[0];
-  const bits = raster.bitsPerSample && raster.bitsPerSample[0] != null ? raster.bitsPerSample[0] : 8;
-  const max = Math.pow(2, bits) - 1;
-  return Converters.RGBAfromBlackIsZero(band0, max);
+  return Converters.RGBAfromBlackIsZero(bandBytes(0), 255);
 }
+
+/** Encoding of a canonical display RGBA buffer: four 8-bit unsigned components. */
+const CANONICAL_RGBA_ENCODING = {
+  version: SAMPLE_ENCODING_VERSION,
+  channels: [0, 1, 2, 3].map(() => ({
+    scale: 255, offset: 0, signed: false, bits: 8, sampleFormat: 1,
+  })),
+};
 
 function packCanonicalRGBA(rgba8, width, height, format) {
   const gpu = (format && format.gpu) || {};
   const preferRGBA8 = gpu.preferRGBA8 !== false;
   const forceRGBA16F = !!gpu.forceRGBA16F;
 
-  // RGBA8 is the default for image-mode unless forced to 16F
+  // RGBA8 is the default for image-mode unless forced to 16F.
+  // RGBA8 texels are normalized to [0,1] by the GPU on sample, so no work is needed here.
   if (preferRGBA8 && !forceRGBA16F) {
     const data = new Uint8Array(rgba8.buffer, rgba8.byteOffset, rgba8.byteLength);
     return {
@@ -307,6 +333,8 @@ function packCanonicalRGBA(rgba8, width, height, format) {
       height,
       mode: "image",
       channelCount: 4,
+      encodingVersion: SAMPLE_ENCODING_VERSION,
+      encoding: CANONICAL_RGBA_ENCODING,
       packs: [{
         format: "RGBA8",
         data: {
@@ -316,19 +344,18 @@ function packCanonicalRGBA(rgba8, width, height, format) {
           length: data.length,
         },
         channels: [0, 1, 2, 3],
-        normalized: false,
-        scale: [1, 1, 1, 1],
+        normalized: true,
+        scale: [255, 255, 255, 255],
         offset: [0, 0, 0, 0],
       }],
     };
   }
 
-  // RGBA16F image-mode: convert bytes -> float -> half
+  // RGBA16F image-mode: display bytes -> [0,1] half floats, same contract as the data path
   const px = width * height;
   const out = new Uint16Array(px * 4);
   for (let i = 0; i < out.length; i++) {
-    // store 0..255 as float 0..255 (identity); shader can treat as linear display
-    out[i] = f32ToF16Bits(rgba8[i]);
+    out[i] = f32ToF16Bits(rgba8[i] / 255);
   }
 
   return {
@@ -336,6 +363,8 @@ function packCanonicalRGBA(rgba8, width, height, format) {
     height,
     mode: "image",
     channelCount: 4,
+    encodingVersion: SAMPLE_ENCODING_VERSION,
+    encoding: CANONICAL_RGBA_ENCODING,
     packs: [{
       format: "RGBA16F",
       data: {
@@ -345,8 +374,8 @@ function packCanonicalRGBA(rgba8, width, height, format) {
         length: out.length,
       },
       channels: [0, 1, 2, 3],
-      normalized: false,
-      scale: [1, 1, 1, 1],
+      normalized: true,
+      scale: [255, 255, 255, 255],
       offset: [0, 0, 0, 0],
     }],
   };
@@ -356,7 +385,9 @@ function packBandsAsData(raster, format) {
   const gpu = (format && format.gpu) || {};
   const preferRGBA8 = gpu.preferRGBA8 !== false;
   const forceRGBA16F = !!gpu.forceRGBA16F;
+  const padAlpha = gpu.padAlpha == null ? 1 : gpu.padAlpha;
 
+  const encoding = rasterEncoding(raster);
   const width = raster.width;
   const height = raster.height;
   const pixelCount = width * height;
@@ -367,12 +398,17 @@ function packBandsAsData(raster, format) {
     : [...Array(bandCount).keys()];
   const channelCount = channels.filter((c) => c != null && c >= 0).length;
 
-  // Decide RGBA8 vs RGBA16F
-  const allU8 = channels.every((c) => {
-    const b = raster.bands[c];
-    return b instanceof Uint8Array || b instanceof Uint8ClampedArray;
+  // Decide RGBA8 vs RGBA16F. The channel must genuinely be 8-bit unsigned, not merely
+  // arrive in a Uint8Array: geotiff.js unpacks 1/2/4-bit samples into one too, and a
+  // texture the sampler divides by 255 would then contradict its declared scale.
+  const allDisplayReady = channels.every((c) => {
+    if (c == null || c < 0) return true; // padding lane, no constraint
+    const ch = channelEncodingAt(encoding, c);
+    const band = raster.bands[c];
+    return ch.bits === 8 && ch.sampleFormat === SAMPLE_FORMAT.UINT &&
+      (band instanceof Uint8Array || band instanceof Uint8ClampedArray);
   });
-  const useRGBA8 = preferRGBA8 && !forceRGBA16F && allU8;
+  const useRGBA8 = preferRGBA8 && !forceRGBA16F && allDisplayReady;
 
   const packs = [];
   for (let p = 0; p < channels.length; p += 4) {
@@ -383,59 +419,57 @@ function packBandsAsData(raster, format) {
       channels[p + 3] ?? -1,
     ];
 
+    // Unused lanes read as 0, except the alpha lane: a pack of fewer than 4 channels
+    // would otherwise be fully transparent to any renderer that premultiplies by .a.
+    const padValue = (k) => (k === 3 ? padAlpha : 0);
+
     if (useRGBA8) {
       const data = new Uint8Array(pixelCount * 4);
       for (let i = 0, j = 0; i < pixelCount; i++, j += 4) {
         for (let k = 0; k < 4; k++) {
           const bi = packCh[k];
-          data[j + k] = (bi >= 0 && bi < raster.bands.length) ? raster.bands[bi][i] : 0;
+          data[j + k] = (bi >= 0 && bi < raster.bands.length)
+            ? raster.bands[bi][i]
+            : Math.round(padValue(k) * 255);
         }
       }
       packs.push({
         format: "RGBA8",
         data: { ctor: "Uint8Array", buffer: data.buffer, byteOffset: 0, length: data.length },
         channels: packCh,
-        normalized: false,
-        scale: [1, 1, 1, 1],
-        offset: [0, 0, 0, 0],
+        normalized: true,
+        scale: packCh.map((bi) => (bi >= 0 ? channelEncodingAt(encoding, bi).scale : 1)),
+        offset: packCh.map((bi) => (bi >= 0 ? channelEncodingAt(encoding, bi).offset : 0)),
       });
       continue;
     }
 
-    // RGBA16F packing with "auto normalization if needed"
-    // If integer max exceeds half float range (65504), normalize to [0..1] using scale=max.
+    // RGBA16F packing. The declared encoding is applied unconditionally, so every
+    // component reaching the GPU is in [0,1] -- or [-1,1] for signed sample formats.
     const data = new Uint16Array(pixelCount * 4);
     const scale = [1, 1, 1, 1];
     const offset = [0, 0, 0, 0];
+    const packEnc = [null, null, null, null];
 
     for (let k = 0; k < 4; k++) {
       const bi = packCh[k];
       if (bi < 0 || bi >= raster.bands.length) continue;
 
-      const bits = raster.bitsPerSample && raster.bitsPerSample[bi] != null ? raster.bitsPerSample[bi] : (raster.bitsPerSample ? raster.bitsPerSample[0] : 8);
-      const band = raster.bands[bi];
-      const isFloat = band instanceof Float32Array || band instanceof Float64Array;
-
-      if (!isFloat) {
-        const max = bits > 0 ? (Math.pow(2, bits) - 1) : 65535;
-        if (max > 65504) {
-          // normalize to 0..1 for safe half range; shader reconstructs with value = sample * scale + offset
-          scale[k] = max;
-          offset[k] = 0;
-        }
-      }
+      const ch = channelEncodingAt(encoding, bi);
+      packEnc[k] = ch;
+      scale[k] = ch.scale;
+      offset[k] = ch.offset;
     }
 
     let clamped = false;
     for (let i = 0, j = 0; i < pixelCount; i++, j += 4) {
       for (let k = 0; k < 4; k++) {
         const bi = packCh[k];
-        let v = (bi >= 0 && bi < raster.bands.length) ? Number(raster.bands[bi][i]) : 0;
+        let v = (bi >= 0 && bi < raster.bands.length)
+          ? sampleToUnit(raster.bands[bi][i], packEnc[k])
+          : padValue(k);
 
-        // apply normalization (store v/scale)
-        if (scale[k] !== 1) v = v / scale[k];
-
-        // clamp to half-float finite range when storing raw floats
+        // clamp to half-float finite range; only reachable for out-of-declared-range floats
         if (v > 65504) { v = 65504; clamped = true; }
         else if (v < -65504) { v = -65504; clamped = true; }
 
@@ -446,7 +480,8 @@ function packBandsAsData(raster, format) {
     if (clamped) {
       workerWarn(
         "gpuPack_f16_clamp_worker",
-        "[tiff-worker] Some values exceeded RGBA16F finite range and were clamped. Consider normalization via format.gpu.forceRGBA16F + relying on scale/offset."
+        "[tiff-worker] Some values exceeded RGBA16F finite range after normalization and were clamped. " +
+        "Check SMinSampleValue/SMaxSampleValue on the file."
       );
     }
 
@@ -454,13 +489,21 @@ function packBandsAsData(raster, format) {
       format: "RGBA16F",
       data: { ctor: "Uint16Array", buffer: data.buffer, byteOffset: 0, length: data.length },
       channels: packCh,
-      normalized: false,
+      normalized: true,
       scale,
       offset,
     });
   }
 
-  return { width, height, mode: "data", channelCount, packs };
+  return {
+    width,
+    height,
+    mode: "data",
+    channelCount,
+    encodingVersion: SAMPLE_ENCODING_VERSION,
+    encoding,
+    packs,
+  };
 }
 
 async function decodeRasterFromArrayBuffer(ab, hints) {
@@ -488,6 +531,16 @@ async function decodeRasterFromArrayBuffer(ab, hints) {
   const sampleFormat = getSampleFormat(img);
   const photometricInterpretation = getPhotometric(fileDirectory);
   const colorMap = getColorMap(fileDirectory);
+
+  // Fail loudly on SampleFormat 4/5/6 (undefined / complex) rather than rendering garbage.
+  const { sMinSampleValue, sMaxSampleValue } = readSampleRangeTags(fileDirectory);
+  resolveSampleEncoding({
+    bitsPerSample,
+    sampleFormat,
+    sMinSampleValue,
+    sMaxSampleValue,
+    samplesPerPixel,
+  });
 
   const decodeOpts = Object.assign({ interleave: false }, (hints && hints.decode) || {});
   const rasters = normalizeRasters(await img.readRasters({
@@ -548,8 +601,7 @@ function rasterPayloadToTextureSet(rasterPayload, hints) {
   const raster = Object.assign({}, rasterPayload, { bands: reviveBands(rasterPayload.bands) });
   const format = resolveFormatFromHints(hints) || {};
   const interpretation = format.interpretation || "auto";
-  const inferred = inferFromTIFFTags(raster);
-  const mode = (interpretation === "auto") ? inferred : interpretation;
+  const mode = (interpretation === "auto") ? inferFromTIFFTags(raster, format) : interpretation;
 
   if (mode === "image") {
     const rgba = rasterToRGBA8_ImageMode(raster, hints, format);

@@ -3,6 +3,11 @@ import { PromiseWrapper } from "./utils/PromiseWrapper.js";
 import { logOnce } from "./utils/consoleOnce.js"
 import { parsePerkinElmerChannels } from "./formats/perkinElmer.js";
 import { installRawTiffPlugin } from "./formats/tiff.js";
+import {
+  inferInterpretation,
+  readSampleRangeTags,
+  resolveSampleEncoding,
+} from "./utils/tiffEncoding.js";
 
 import * as gtiff from "geotiff";
 window.GeoTIFF = gtiff;
@@ -17,6 +22,9 @@ window.GeoTIFF = gtiff;
  * @param {String} options.workerUrl - URL of the worker script to use for GeoTIFF conversion. Defaults to the worker script bundled with this library.
  * @param {Object} options.workerPool - Worker pool to use for GeoTIFF conversion. Defaults to a new pool created for this instance.
  * @param {Object} [options.httpAdapter] - Optional HTTP adapter for routing all geotiff.js range requests through a custom transport (auth, proxy, retry). Shape: `{ fetch(url, init?) => Promise<Response> }`. When omitted, geotiff.js uses the global `fetch`.
+ * @param {Object} [options.defaults] - Plugin-wide defaults forwarded to installRawTiffPlugin.
+ * @param {Object} [options.defaults.format] - Default {@link FormatOptions} merged into every conversion.
+ * @param {Function} [options.defaults.toneMap] - Override for the CPU renderer's sample -> display byte mapping.
  */
 export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
 
@@ -30,6 +38,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
     workerUrl,     // optional: string or URL
     workerPool,    // optional: { createWorker: () => Worker }
     httpAdapter,   // optional: { fetch(url, init?) => Promise<Response> }
+    defaults,      // optional: { format, toneMap }
   } = options;
 
   const AdapterClientCtor = httpAdapter
@@ -77,6 +86,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
   // Ensure RawTIFF converter plugin is installed.
   const RawTiffAPI = OpenSeadragon.RawTiffPlugin || installRawTiffPlugin(OpenSeadragon, {
     workerPool: effectiveWorkerPool,
+    defaults,
   });
 
   let tsCounter = 0;
@@ -115,22 +125,45 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
     static sharedPool = new Pool();
 
     constructor(input, opts = { logLatency: false }) {
-      super();
+      // keep a reference to which instance we are; this will be unique for different sources.
+      const instanceId = tsCounter++;
+
+      // Options-object form: what OSD autodetection hands us (see configure()) and what
+      // callers pass when they want options and a url in one object.
+      const isFile = typeof File !== "undefined" && input instanceof File;
+      if (input && typeof input === "object" && !isFile &&
+          !input.GeoTIFF && typeof input.url === "string") {
+        opts = Object.assign({}, input, opts);
+        input = input.url;
+      }
+
+      // Construct through OpenSeadragon's url branch. It installs safe defaults, leaves
+      // ready === false and raises NO 'ready' event, so the only 'ready' this source ever
+      // emits is the real one from setupComplete().
+      //
+      // The no-argument form cannot do this: with no url, TileSource takes the else branch
+      // and raises 'ready' immediately (or from a setTimeout when ready === false), and the
+      // base handler snapshots a source that knows nothing -- dimensions = Point(NaN, NaN),
+      // maxLevel = 0. TiledImage's normHeight is assigned exactly once from that, so the
+      // slide's home bounds become NaN and no tile is ever drawn.
+      super(typeof input === "string" ? input : `geotiff://${instanceId}`);
 
       let self = this;
 
       this.input = input;
       this.options = opts;
-      this.channel = input?.channel ?? null;
+      this.channel = input?.channel ?? opts?.channel ?? null;
+
+      /**
+       * Per-source {@link FormatOptions} override. Reaches the converters through the
+       * raster hints and through resolveExternalFormat's tile.tiledImage.source probe.
+       */
+      this.format = opts?.format ?? input?.format ?? null;
 
       this._ready = false;
       this._pool = GeoTIFFTileSource.sharedPool;
       this._tileSize = 256;
-
-      // keep a reference to which instance we are; this will be unique for different sources.
-      this._tsCounter = tsCounter;
-      // increment the "global" variable
-      tsCounter += 1;
+      this._tsCounter = instanceId;
 
       if (input.GeoTIFF && input.GeoTIFFImages) {
         this.promises = {
@@ -167,9 +200,78 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
           })
           .catch((error) => {
             console.error("Re-throwing error with GeoTIFF:", error);
+            // The source stays not-ready, so anything awaiting it must be told, or it
+            // waits forever. OSD's waitUntilReady listens for exactly this event.
+            self.promises.ready.promise.catch(() => { /* nobody may be awaiting it */ });
+            self.promises.ready.reject(error);
+            self.raiseEvent("open-failed", {
+              message: error && error.message ? error.message : String(error),
+              source: self.url,
+            });
             throw error;
           });
       }
+    }
+
+    /**
+     * OpenSeadragon calls this from the url branch of TileSource to fetch an info document.
+     * This source loads the TIFF header itself in the constructor, and the url points at
+     * the image data -- downloading it as an info document would be catastrophic.
+     */
+    getImageInfo() { /* no-op by design */ }
+
+    /**
+     * Autodetection entry point. Must live on the prototype: TileSource.determineType
+     * calls `OpenSeadragon[Type].prototype.supports.call(...)`.
+     *
+     * Note `this` is the *viewer* here, not a tile source.
+     *
+     * @param {String|Object|ArrayBuffer|TypedArray} data
+     * @param {String} [url]
+     * @returns {Boolean}
+     */
+    supports(data, url) {
+      if (data && typeof data === "object" && typeof data.type === "string" &&
+          /^(geo)?tiff$/i.test(data.type)) {
+        return true;
+      }
+
+      const target = (typeof data === "string" && data) ||
+        (data && typeof data === "object" && typeof data.url === "string" && data.url) ||
+        url;
+      if (typeof target === "string" &&
+          /\.(tiff?|qptiff|ome\.tiff?|btf|svs|ndpi|scn)(\?|#|$)/i.test(target)) {
+        return true;
+      }
+
+      // TIFF magic: "II" + 42/43 (little endian) or "MM" + 42/43 (big endian).
+      let bytes = null;
+      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data, 0, Math.min(4, data.byteLength));
+      else if (ArrayBuffer.isView(data)) {
+        bytes = new Uint8Array(data.buffer, data.byteOffset, Math.min(4, data.byteLength));
+      }
+      if (bytes && bytes.length >= 4) {
+        const version = bytes[0] === 0x49 ? bytes[2] | (bytes[3] << 8) : (bytes[2] << 8) | bytes[3];
+        const validVersion = version === 42 || version === 43;
+        if (bytes[0] === 0x49 && bytes[1] === 0x49 && validVersion) return true;
+        if (bytes[0] === 0x4d && bytes[1] === 0x4d && validVersion) return true;
+      }
+
+      return false;
+    }
+
+    /**
+     * Build constructor options from what autodetection matched. `this` is the viewer.
+     *
+     * @param {String|Object} data
+     * @param {String} [url]
+     * @returns {Object}
+     */
+    configure(data, url) {
+      if (typeof data === "string") return { url: data };
+      const configured = Object.assign({}, data);
+      if (url && !configured.url) configured.url = url;
+      return configured;
     }
 
     static async getAllTileSources (input, opts) {
@@ -184,8 +286,6 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
       return Promise.all(
         Array.from({ length: imageCount }, (_, i) => tiff.getImage(i))
       ).then((images) => {
-        let tiff = input instanceof File ? fromBlob(input) : fromUrl(input);
-
         images = this.userDefinedImagesFilter(images, opts);
         // Filter out images with photometricInterpretation.TransparencyMask
         images = images.filter(
@@ -375,7 +475,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
     downloadTileAbort(context) {
       const ctrl = (context.userData && context.userData.abortController);
       if (ctrl) ctrl.abort();
-      else $.console.error("Could not abort download: controller not available.");
+      else OpenSeadragon.console.error("Could not abort download: controller not available.");
     }
 
     setupComplete() {
@@ -474,10 +574,87 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
       }
       this.levels = this.levels.sort((a, b) => a.width - b.width);
 
-      this._tileWidth = this.levels[0].tileWidth;
-      this._tileHeight = this.levels[0].tileHeight;
+      // Public names on purpose: the base 'ready' handler moves them into _tileWidth /
+      // _tileHeight and deletes these. Assigning the underscored fields directly would be
+      // undone by that handler, leaving zeros behind.
+      this.tileWidth = this.levels[0].tileWidth;
+      this.tileHeight = this.levels[0].tileHeight;
 
       this.setupComplete();
+    }
+
+    /**
+     * Declared sample encoding of the displayed plane -- the contract the GPU packs obey.
+     * Every component of a pack is (rawSample - offset) / scale, so it lands in [0,1],
+     * or [-1,1] for signed sample formats.
+     *
+     * @returns {import("./utils/tiffEncoding.js").SampleEncoding}
+     */
+    getSampleEncoding() {
+      return this.getTiffDescriptor().encoding;
+    }
+
+    /**
+     * Everything a consumer needs to interpret this source's tiles, resolved from the
+     * full-resolution plane's file directory. Available once the source is ready.
+     *
+     * @returns {Object}
+     */
+    getTiffDescriptor() {
+      if (this._descriptor) return this._descriptor;
+      if (!this._ready) {
+        throw new Error(
+          "[GeoTIFFTileSource] getTiffDescriptor() is unavailable until the header is parsed; " +
+          "await tileSource.promises.ready first."
+        );
+      }
+
+      const image = this.levels[this.maxLevel].image;
+      const fd = image.fileDirectory || {};
+
+      const bitsPerSample = Array.from(fd.BitsPerSample || [8]);
+      const sampleFormat = fd.SampleFormat ? Array.from(fd.SampleFormat) : null;
+      const samplesPerPixel = Math.max(fd.SamplesPerPixel || 0, bitsPerSample.length);
+      const { sMinSampleValue, sMaxSampleValue } = readSampleRangeTags(fd);
+
+      const encoding = resolveSampleEncoding({
+        bitsPerSample,
+        sampleFormat,
+        sMinSampleValue,
+        sMaxSampleValue,
+        samplesPerPixel,
+      });
+
+      // Identity split unless the source carries an explicit channel order.
+      const channels = (this.format && Array.isArray(this.format.channels) && this.format.channels.length)
+        ? this.format.channels.slice()
+        : [...Array(samplesPerPixel).keys()];
+
+      const requested = this.format && this.format.interpretation;
+      const interpretationResolved = (requested && requested !== "auto")
+        ? requested
+        : inferInterpretation({
+            photometricInterpretation: fd.PhotometricInterpretation,
+            samplesPerPixel,
+            hasColorMap: !!fd.ColorMap,
+            encoding,
+          }, channels);
+
+      this._descriptor = {
+        width: this.width,
+        height: this.height,
+        samplesPerPixel,
+        bitsPerSample,
+        sampleFormat,
+        photometricInterpretation: fd.PhotometricInterpretation,
+        hasColorMap: !!fd.ColorMap,
+        channelNames: this.channel?.name ? [this.channel.name] : [],
+        channelColors: this.channel?.color ? [this.channel.color] : [],
+        channels,
+        interpretationResolved,
+        encoding,
+      };
+      return this._descriptor;
     }
 
     static getGeoTiffFileDirectory(geoTiffFile) {
@@ -672,6 +849,10 @@ high-resolution lowest level will be shown. Note that loading such data can cras
           hints: {
             ...(this.channel ? { channel: this.channel } : {}),
             ...(tintRGB ? { tintRGB } : {}),
+            // Per-source format override. Deliberately `format`, not `formatResolved`:
+            // the tile source does not own the plugin defaults, so the converter must
+            // still merge this on top of them.
+            ...(this.format ? { format: this.format } : {}),
           },
         });
 
@@ -685,6 +866,21 @@ high-resolution lowest level will be shown. Note that loading such data can cras
       });
     }
   }
+
+  /**
+   * Open a GeoTIFF through the same transport the tile sources use, including the
+   * httpAdapter passed to enableGeoTIFFTileSource. Lets a client read a header (auth,
+   * CSRF, proxy routing intact) without opening a slide and without reaching for
+   * GeoTIFF.fromUrl, which would bypass the adapter.
+   *
+   * @param {File|Blob|String} input
+   * @param {Object} [geotiffOptions] options forwarded to geotiff.js
+   * @returns {Promise<GeoTIFF>}
+   */
+  GeoTIFFTileSource.openGeoTIFF = (input, geotiffOptions) =>
+    (typeof Blob !== "undefined" && input instanceof Blob) // File extends Blob
+      ? fromBlob(input, geotiffOptions)
+      : openRemote(input, geotiffOptions);
 
   // Attach the class to the OpenSeadragon namespace
   OpenSeadragon.GeoTIFFTileSource = GeoTIFFTileSource;

@@ -84,6 +84,7 @@ This will make the `OpenSeadragon.GeoTIFFTileSource` class available for use.
 | `workerUrl` | `string \| URL` | URL of the worker script used for GeoTIFF decoding. Defaults to the worker bundled with this library. |
 | `workerPool` | `{ createWorker: () => Worker }` | Custom worker pool. Defaults to a pool that uses `workerUrl`. |
 | `httpAdapter` | `{ fetch(url, init?) => Promise<Response> }` | Optional HTTP adapter routing **all** geotiff.js range requests through a custom transport. See below. |
+| `defaults` | `{ format?, toneMap? }` | Plugin-wide defaults. `format` is merged into every conversion (see [Options](#options-format-gpu-packing-and-layout-hints)); `toneMap(value, bandIndex, raster)` overrides the CPU renderer's sample → display byte mapping. |
 
 ### Custom HTTP transport (`httpAdapter`)
 
@@ -147,6 +148,45 @@ const viewer = new OpenSeadragon.Viewer({
 viewer.open(tiffTileSources);
 ```
 
+#### Autodetection
+
+The class implements `supports()`/`configure()`, so OpenSeadragon can select it on its own from a
+TIFF url, TIFF magic bytes, or an explicit `type`:
+
+```javascript
+viewer.open({ url: "https://example.org/slide.tif" });
+viewer.open({ type: "geotiff", url: myUrl });
+```
+
+Use the **object** form. A bare string (`viewer.open("slide.tif")`) makes OpenSeadragon construct a
+base `TileSource` and download the url as an info document *before* autodetection runs — for a TIFF
+that means fetching the whole file. This library cannot intercept that.
+
+The source is not `ready` until the header has been parsed. Await `tileSource.promises.ready.promise`,
+or listen for the `ready` event, before reading `width`/`height`/`dimensions`/`maxLevel`.
+
+#### Describing a source
+
+Once ready, a tile source describes its own content — useful to configure a renderer before the first
+tile arrives:
+
+```javascript
+const descriptor = tileSource.getTiffDescriptor();
+// { width, height, samplesPerPixel, bitsPerSample[], sampleFormat[], photometricInterpretation,
+//   hasColorMap, channelNames[], channelColors[], channels[], interpretationResolved, encoding }
+
+const encoding = tileSource.getSampleEncoding();  // same as descriptor.encoding
+```
+
+`interpretationResolved` is decided by the same rule the decoder uses, so client and decoder cannot
+disagree about a file. See [Sample encoding](#sample-encoding) for `encoding`.
+
+#### Reading a header without opening a slide
+
+`GeoTIFFTileSource.openGeoTIFF(input, geotiffOptions)` opens a `GeoTIFF` through the same transport the
+tile sources use — including a configured `httpAdapter`. Prefer it over `GeoTIFF.fromUrl`, which
+bypasses the adapter (and therefore any auth, CSRF or proxy routing it provides).
+
 ### Using the data types directly
 If you have a tiff-like data and you need to render them directly, you can use predefined types introduced
 by this plugin.
@@ -175,9 +215,35 @@ Conceptually:
   - "data": independent channels packed for scientific rendering
 - packs: Array<{ format: "RGBA8" | "RGBA16F", channels: [c0,c1,c2,c3], data: TypedArray/Float32Array, width, height }>
   - channels are packed in groups of 4 (packsOf4)
-  - padding channels are -1
+  - padding channels are -1; their lane reads `0`, except the alpha lane, which is opaque
+    (see `format.gpu.padAlpha`)
 - channelCount: number of channels (excluding padding)
+- encodingVersion / encoding: the sample encoding contract, see below
 - for direct use on, for example, GPU
+
+#### Sample encoding
+
+Every component of a pack is normalized: **`stored = (rawSample - offset) / scale`**, so it lands in
+`[0,1]` — or `[-1,1]` when the sample format is signed. `scale`/`offset` are per-channel and are
+carried on each pack, so the original measurement is `stored * scale + offset`. RGBA8 packs store raw
+bytes and rely on the GPU normalizing on sample; the same relation holds after that divide.
+
+`scale`/`offset` are derived from TIFF tags alone:
+
+| SampleFormat | `scale` | `offset` |
+| --- | --- | --- |
+| 1 — unsigned int | `2^bits - 1` | `0` |
+| 2 — signed int | `2^(bits-1) - 1` | `0` (signed) |
+| 3 — float | `(SMaxSampleValue - SMinSampleValue) \|\| 1` | `SMinSampleValue` |
+| 4/5/6 | rejected — decoding throws | |
+
+A float plane with no `SMinSampleValue`/`SMaxSampleValue` resolves to the identity transform, i.e. the
+file is taken at its word.
+
+`gpuTextureSet.encodingVersion` is `1` for the contract above; `encoding` is the
+`{ version, channels: [{ scale, offset, signed, bits, sampleFormat }] }` descriptor it was derived from.
+A tile source exposes the same descriptor before the first tile via
+`tileSource.getSampleEncoding()` and `tileSource.getTiffDescriptor()`.
 
 #### image-like types
 
@@ -200,17 +266,26 @@ These decisions are controlled through the `format` options object.
 
 Options can be provided from multiple places. Later sources override earlier ones:
 
-1. **Global defaults** at install time (recommended for app-wide behavior)
+1. **Global defaults** at install time: `enableGeoTIFFTileSource(OSD, { defaults: { format: { ... } } })`
+   (recommended for app-wide behavior)
 2. **Per-load hints** (e.g. passed to `getAllTileSources(..., { hints: { format: ... } })`)
-3. **Per-tile/per-raster overrides** (advanced usage; e.g. `rawTiff.hints.format`, `tiffRaster.hints.format`, or `tile.format`)
+3. **Per-source**: `opts.format` on the tile source — forwarded onto every raster it produces, and
+   also read off `tile.tiledImage.source.format` by the converters
+4. **Per-tile/per-raster overrides** (advanced usage; e.g. `rawTiff.hints.format`, `tiffRaster.hints.format`, or `tile.format`)
 
 ### `format` options
 
 #### `format.interpretation`
 `"auto" | "image" | "data"` (default `"auto"`)
 
-- `"auto"`: Infer image-vs-data from TIFF tags. Typical RGB/Gray files become `"image"`. Unusual band counts or missing color tags tend to become `"data"`.
+- `"auto"`: Infer image-vs-data from TIFF tags. A file is `"image"` only when its photometric
+  interpretation implies a picture **and** every selected band is 8-bit integer — that path builds an
+  8-bit RGBA buffer, so anything deeper would be destroyed by it. `Palette` *with* a ColorMap is exempt
+  from the bit-depth test (a LUT is a display transform, indexed by the raw sample at any depth); a
+  palette file missing its ColorMap is not. Everything else — 16-bit RGB, float grayscale, unusual band
+  counts, missing color tags — is `"data"`.
 - `"image"`: Force image-like interpretation (use color-space conversion / RGBA mapping logic).
+  Deep samples are rescaled to display bytes through the declared encoding, not truncated.
 - `"data"`: Force data interpretation (bands are preserved and packed for GPU).
 
 #### `format.channels`
@@ -222,11 +297,19 @@ If `null`, the library packs channels in natural order.
 #### `format.gpu`
 GPU packing options (used when converting to `gpuTextureSet`).
 
-- `preferRGBA8` (boolean, default `true`): If all selected channels are 8-bit, pack into RGBA8.
+- `preferRGBA8` (boolean, default `true`): If all selected channels are 8-bit unsigned, pack into RGBA8.
+  Sub-byte depths (1/2/4-bit) do **not** qualify even though they arrive in a `Uint8Array` — they go to
+  RGBA16F, where their `scale` is applied exactly.
 - `forceRGBA16F` (boolean, default `false`): Always pack into RGBA16F (half-float) even if RGBA8 would be possible.
 - `packMode` (`"packsOf4"`, default `"packsOf4"`): Pack channels into RGBA textures in groups of 4.
+- `padAlpha` (number, default `1`): Unit value written into the alpha lane of a pack that has no fourth
+  channel (`channels[3] === -1`). Defaults to opaque, so a 3-channel pack is not invisible to a renderer
+  that premultiplies by `.a`. Spare *colour* lanes are always `0`. Set to `0` if the consumer sums pack
+  components rather than blending them.
 
-**Precision note:** when using RGBA16F packs, integer bands are converted to float prior to upload so shaders can operate with good precision.
+**Precision note:** RGBA16F packs carry normalized half-floats — see [Sample encoding](#sample-encoding).
+Nothing is lost by always normalizing: binary16 carries ~11 significant bits regardless of magnitude,
+and it is what makes the RGBA8 fallback banded-but-correct instead of clamped to white.
 
 #### `format.image`
 Image mapping options for ambiguous cases.

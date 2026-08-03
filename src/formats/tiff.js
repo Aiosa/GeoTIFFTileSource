@@ -21,6 +21,37 @@ import { fromBlob, fromArrayBuffer, globals } from "geotiff";
 import { Converters } from "../utils/Converters.js";
 import defaultFormat from "./options.js";
 import { logOnce } from "../utils/consoleOnce.js";
+import {
+  SAMPLE_ENCODING_VERSION,
+  channelEncodingAt,
+  readSampleRangeTags,
+  resolveSampleEncoding,
+  sampleToByte,
+} from "../utils/tiffEncoding.js";
+
+/**
+ * Declared sample encoding of a raster, resolved once and cached on it.
+ * Mirrors the worker helper of the same name so both sides agree on any file.
+ * @param {TiffRaster} raster
+ * @returns {import("../utils/tiffEncoding.js").SampleEncoding}
+ */
+function rasterEncoding(raster) {
+  if (raster.__encoding) return raster.__encoding;
+
+  const { sMinSampleValue, sMaxSampleValue } = readSampleRangeTags(raster.fileDirectory);
+  const encoding = resolveSampleEncoding({
+    bitsPerSample: raster.bitsPerSample,
+    sampleFormat: raster.sampleFormat,
+    sMinSampleValue,
+    sMaxSampleValue,
+    samplesPerPixel: Math.max(
+      raster.samplesPerPixel || 0,
+      raster.bands ? raster.bands.length : 0
+    ),
+  });
+  raster.__encoding = encoding;
+  return encoding;
+}
 
 function __rt_makeDeferred() {
   /** @type {(v:any)=>void} */ let resolve;
@@ -49,12 +80,19 @@ function __rt_errorToString(err) {
  *      RGBA8  -> Uint8Array length = width*height*4
  *      RGBA16F-> Uint16Array length = width*height*4  (IEEE-754 half-float bit patterns)
  *  - channels: length 4 array of source band indices (or -1 if padding)
- *  - scale/offset: optional per-channel transform to apply in shader (default identity)
+ *  - normalized: true once encodingVersion >= 1 -- components are in the declared unit range
+ *  - scale/offset: the per-channel transform that WAS APPLIED, i.e. the stored component is
+ *      (rawSample - offset) / scale. A consumer that wants the original measurement inverts it:
+ *      rawSample = stored * scale + offset. RGBA8 packs store raw bytes and rely on the GPU
+ *      normalizing on sample, so the same relation holds after the hardware divide by 255.
  *
  * Top-level:
  *  - width, height: texture dimensions
  *  - mode: "image" | "data"
  *  - channelCount: total logical channels represented in this set
+ *  - encodingVersion: contract version; 1 means every component reaching the GPU is in [0,1]
+ *      (or [-1,1] for signed sample formats)
+ *  - encoding: the {version, channels[]} descriptor the transform was derived from
  */
 export class GpuTextureSet {
   constructor(params) { Object.assign(this, params); }
@@ -234,8 +272,12 @@ function resolveExternalFormat(tile, dataOrRaster) {
   if (tile && tile.format) return tile.format;
   if (tile && tile.userData && tile.userData.format) return tile.userData.format;
 
-  // 4) tileSource / viewer config
-  const ts = tile && (tile.source || tile.tileSource || tile._tileSource);
+  // 4) tileSource / viewer config.
+  //    An OpenSeadragon.Tile carries none of source/tileSource/_tileSource -- tiledImage
+  //    is the only link that actually exists -- but the older probes stay for callers that
+  //    pass something else as `tile`.
+  const ts = tile && (tile.source || tile.tileSource || tile._tileSource ||
+    (tile.tiledImage && tile.tiledImage.source));
   if (ts && ts.format) return ts.format;
   if (ts && ts.options && ts.options.format) return ts.options.format;
 
@@ -278,6 +320,8 @@ function __rt_reviveGpuTextureSetPayload(p) {
     height: p.height,
     mode: p.mode,
     channelCount: p.channelCount,
+    encodingVersion: p.encodingVersion,
+    encoding: p.encoding,
     packs,
   });
 }
@@ -297,10 +341,10 @@ export function installRawTiffPlugin(OpenSeadragon, opts = {}) {
 
   if ($.RawTiffPlugin && $.RawTiffPlugin.__installed) return $.RawTiffPlugin;
 
-  const defaults = Object.assign({
-    toneMap: null,
-    format: deepMerge(defaultFormat, (opts.defaults && opts.defaults.format) || null),
-  }, opts.defaults || {});
+  // Merge AFTER the assign: a caller's raw `format` would otherwise overwrite the merged
+  // one wholesale, dropping every default key it did not restate.
+  const defaults = Object.assign({ toneMap: null }, opts.defaults || {});
+  defaults.format = deepMerge(defaultFormat, (opts.defaults && opts.defaults.format) || null);
 
   const workerPoolOptions = Object.assign({
     enabled: true,
@@ -507,36 +551,57 @@ export function installRawTiffPlugin(OpenSeadragon, opts = {}) {
   }
 
   async function __rt_tiffRasterToGpuTextureSet(tile, raster) {
-    const pool = getWorkerPool();
-    if (!pool) {
-      // main-thread fallback: keep existing behavior (not ideal, but functional)
-      // Here we reuse the existing RGBA8 renderer if needed, but for data packing you probably want worker.
-      logOnce("gpuTextureSet_no_worker", "[RawTiffPlugin] No worker pool available; gpuTextureSet packing will fall back to worker-less path (slower).", "warn");
-      // Minimal fallback: treat as data, pack first 4 bands to RGBA8
-      const width = raster.width;
-      const height = raster.height;
-      const px = width * height;
-      const out = new Uint8Array(px * 4);
-      for (let i = 0, j = 0; i < px; i++, j += 4) {
-        out[j] = raster.bands[0] ? raster.bands[0][i] : 0;
-        out[j + 1] = raster.bands[1] ? raster.bands[1][i] : 0;
-        out[j + 2] = raster.bands[2] ? raster.bands[2][i] : 0;
-        out[j + 3] = raster.bands[3] ? raster.bands[3][i] : 255;
-      }
-      return new GpuTextureSet({
-        width, height,
-        mode: "data",
-        channelCount: raster.bands ? raster.bands.length : 0,
-        packs: [{ format: "RGBA8", data: out, channels: [0, 1, 2, 3], normalized: false, scale: [1,1,1,1], offset: [0,0,0,0] }],
-      });
-    }
-
-    // Serialize raster bands (transfer) + forward resolved format
+    // Resolve the format before branching -- the worker-less fallback obeys the same
+    // options (padAlpha in particular) as the worker packer.
     const hints = raster.hints || {};
     const extFmt = resolveExternalFormat(tile, raster);
     const mergedFmt = deepMerge(defaults.format, extFmt || null);
     const hintsOut = Object.assign({}, hints, { formatResolved: mergedFmt });
 
+    const pool = getWorkerPool();
+    if (!pool) {
+      // main-thread fallback: keep existing behavior (not ideal, but functional)
+      // Here we reuse the existing RGBA8 renderer if needed, but for data packing you probably want worker.
+      logOnce("gpuTextureSet_no_worker", "[RawTiffPlugin] No worker pool available; gpuTextureSet packing will fall back to worker-less path (slower).", "warn");
+      // Minimal fallback: treat as data, pack first 4 bands to RGBA8.
+      // Bands are rescaled through the declared encoding so the fallback obeys the same
+      // contract as the worker packer -- it is banded, not wrong.
+      const width = raster.width;
+      const height = raster.height;
+      const px = width * height;
+      const encoding = rasterEncoding(raster);
+      const padAlpha = mergedFmt.gpu?.padAlpha == null ? 1 : mergedFmt.gpu.padAlpha;
+
+      const out = new Uint8Array(px * 4);
+      const packChannels = [0, 1, 2, 3].map((k) => (raster.bands[k] ? k : -1));
+      for (let k = 0; k < 4; k++) {
+        const band = raster.bands[k];
+        if (!band) {
+          const pad = Math.round((k === 3 ? padAlpha : 0) * 255);
+          if (pad) for (let i = 0; i < px; i++) out[i * 4 + k] = pad;
+          continue;
+        }
+        const ch = channelEncodingAt(encoding, k);
+        for (let i = 0; i < px; i++) out[i * 4 + k] = sampleToByte(band[i], ch);
+      }
+      return new GpuTextureSet({
+        width, height,
+        mode: "data",
+        channelCount: raster.bands ? raster.bands.length : 0,
+        encodingVersion: SAMPLE_ENCODING_VERSION,
+        encoding,
+        packs: [{
+          format: "RGBA8",
+          data: out,
+          channels: packChannels,
+          normalized: true,
+          scale: packChannels.map((k) => (k >= 0 ? channelEncodingAt(encoding, k).scale : 1)),
+          offset: packChannels.map((k) => (k >= 0 ? channelEncodingAt(encoding, k).offset : 0)),
+        }],
+      });
+    }
+
+    // Serialize raster bands (transfer)
     const bands = raster.bands.map((arr) => ({
       ctor: arr.constructor?.name || "Uint8Array",
       buffer: arr.buffer,
@@ -567,18 +632,7 @@ export function installRawTiffPlugin(OpenSeadragon, opts = {}) {
 
   function defaultToneMap(value, bandIndex, raster) {
     if (value == null || Number.isNaN(value)) return 0;
-
-    const band = raster.bands[bandIndex];
-    const isFloat = band instanceof Float32Array || band instanceof Float64Array;
-    if (isFloat) {
-      const v = Math.max(0, Math.min(1, value));
-      return Math.round(v * 255);
-    }
-
-    const bits = raster.bitsPerSample && raster.bitsPerSample[bandIndex] != null ? raster.bitsPerSample[bandIndex] : (raster.bitsPerSample ? raster.bitsPerSample[0] : 8);
-    const max = bits <= 0 ? 255 : Math.pow(2, bits) - 1;
-    if (max <= 255) return Math.max(0, Math.min(255, value));
-    return Math.round(Math.max(0, Math.min(1, value / max)) * 255);
+    return sampleToByte(value, channelEncodingAt(rasterEncoding(raster), bandIndex));
   }
 
   function rasterToRGBA8(raster) {
@@ -601,21 +655,14 @@ export function installRawTiffPlugin(OpenSeadragon, opts = {}) {
     }
 
     if ((photometric === PIx.WhiteIsZero || photometric === PIx.BlackIsZero) && spp >= 1) {
+      // Map through the tone map first, so a >8-bit or float plane is rescaled rather
+      // than truncated -- the same thing the worker image path does.
       const band0 = raster.bands[0];
-      const bits = raster.bitsPerSample && raster.bitsPerSample[0] != null ? raster.bitsPerSample[0] : 8;
-      const max = Math.pow(2, bits) - 1;
+      const gray = new Uint8ClampedArray(band0.length);
+      for (let i = 0; i < band0.length; i++) gray[i] = toneMap(band0[i], 0, raster);
 
-      if (photometric === PIx.WhiteIsZero) return Converters.RGBAfromWhiteIsZero(band0, max);
-      if (photometric === PIx.BlackIsZero) return Converters.RGBAfromBlackIsZero(band0, max);
-
-      const out = new Uint8ClampedArray(pixelCount * 4);
-      for (let i = 0, j = 0; i < pixelCount; i++, j += 4) {
-        let v = toneMap(band0[i], 0, raster);
-        if (photometric === PIx.WhiteIsZero) v = 255 - v;
-        out[j] = out[j + 1] = out[j + 2] = v;
-        out[j + 3] = 255;
-      }
-      return out;
+      if (photometric === PIx.WhiteIsZero) return Converters.RGBAfromWhiteIsZero(gray, 255);
+      return Converters.RGBAfromBlackIsZero(gray, 255);
     }
 
     const channels = renderChannels ||
@@ -720,6 +767,12 @@ export function installRawTiffPlugin(OpenSeadragon, opts = {}) {
     rasterToRGBA8,
     rasterToContext2d,
     rasterToImageBitmap,
+
+    // Sample encoding contract (see utils/tiffEncoding.js). A consumer can resolve the
+    // same descriptor the packer used, without duplicating the rules.
+    SAMPLE_ENCODING_VERSION,
+    resolveSampleEncoding,
+    rasterEncoding,
 
     getWorkerPool,
     terminateWorkerPool() {

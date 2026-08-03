@@ -24,6 +24,10 @@
  *   Always pack into RGBA16F (half-float) even when RGBA8 would be possible.
  * @property {GpuPackMode} [packMode="packsOf4"]
  *   Packing strategy.
+ * @property {number} [padAlpha=1]
+ *   Unit value written into the alpha lane of a pack that has no fourth channel.
+ *   Defaults to opaque; set to 0 if the consumer sums pack components instead of
+ *   blending them.
  */
 
 /**
@@ -99,6 +103,7 @@ const defaultFormat = {
     preferRGBA8: true,
     forceRGBA16F: false,
     packMode: "packsOf4",
+    padAlpha: 1,
   },
   image: {
     rgbaChannels: null,

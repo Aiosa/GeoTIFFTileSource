@@ -249,21 +249,38 @@ Conceptually:
 #### Sample encoding
 
 Every component of a pack is normalized: **`stored = (rawSample - offset) / scale`**, so it lands in
-`[0,1]` — or `[-1,1]` when the sample format is signed. `scale`/`offset` are per-channel and are
+`[0,1]` — or `[-1,1]` when the channel reports `signed`. `scale`/`offset` are per-channel and are
 carried on each pack, so the original measurement is `stored * scale + offset`. RGBA8 packs store raw
 bytes and rely on the GPU normalizing on sample; the same relation holds after that divide.
 
-`scale`/`offset` are derived from TIFF tags alone:
+`scale`/`offset` are derived from TIFF tags alone. A usable `SMinSampleValue`/`SMaxSampleValue` pair
+always wins, whatever the sample format; otherwise the container range is used:
 
-| SampleFormat | `scale` | `offset` |
-| --- | --- | --- |
-| 1 — unsigned int | `2^bits - 1` | `0` |
-| 2 — signed int | `2^(bits-1) - 1` | `0` (signed) |
-| 3 — float | `(SMaxSampleValue - SMinSampleValue) \|\| 1` | `SMinSampleValue` |
-| 4/5/6 | rejected — decoding throws | |
+| | `scale` | `offset` | `signed` |
+| --- | --- | --- | --- |
+| any format, valid SMin/SMax | `SMax - SMin` | `SMin` | `false` |
+| 1 — unsigned int | `2^bits - 1` | `0` | `false` |
+| 2 — signed int | `2^(bits-1) - 1` | `0` | `true` |
+| 3 — float | `1` (identity) | `0` | `true` |
+| 4/5/6 | rejected — decoding throws | | |
 
-A float plane with no `SMinSampleValue`/`SMaxSampleValue` resolves to the identity transform, i.e. the
-file is taken at its word.
+Honouring those tags on the **integer** branches is what makes sub-container depths render: a
+10/12/14-bit sensor is stored as `BitsPerSample=16` — how essentially every scientific and clinical
+camera writes them — and normalizing such a plane against 65535 renders it at a sixteenth of its
+intended brightness.
+
+The pair is validated, not trusted, because a wrong tag must not render worse than no tag. Rejected,
+falling back to the container range: a lone bound, an inverted or empty range (`SMax <= SMin`),
+non-finite values, and — for integers — a range reaching outside what the bit depth can hold.
+Acceptance is all-or-nothing; a half-applied range would shift a plane without rescaling it.
+
+Note `signed` describes the **normalized** range, not the storage type: a declared range maps onto
+`[0,1]`, so it clears the flag even for signed or float samples.
+
+What this does *not* do is look at pixels. A file that merely happens to use little of its declared
+range is indistinguishable from a dim scene, and guessing from samples would make `scale` depend on
+which tiles decoded first and bake that guess into the tile cache. Recovering those files is a
+display-side concern (window/level), not a decode-side one.
 
 `gpuTextureSet.encodingVersion` is `1` for the contract above; `encoding` is the
 `{ version, channels: [{ scale, offset, signed, bits, sampleFormat }] }` descriptor it was derived from.

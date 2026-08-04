@@ -72,6 +72,46 @@ export function readSampleRangeTags(fileDirectory) {
 }
 
 /**
+ * Declared range of a channel, or null when the tags are absent or unusable.
+ *
+ * The tags are validated rather than trusted: a wrong SMax must not be able to produce a
+ * worse render than no SMax at all. Rejected are a non-finite pair, an empty or inverted
+ * range, a single tag on its own (one bound says nothing about a range), and -- for
+ * integers -- a range reaching outside what the declared bit depth can hold. Each of
+ * those means the writer disagreed with itself, and the container range is then the safer
+ * of the two answers.
+ *
+ * Acceptance is all-or-nothing: a partially applied range would shift a plane without
+ * rescaling it, which is worse than either alternative.
+ *
+ * @param {Object} d descriptor passed to {@link resolveSampleEncoding}
+ * @param {number} index channel index
+ * @param {number|null} limitLow lowest value the container can hold, null for float
+ * @param {number|null} limitHigh highest value the container can hold, null for float
+ * @returns {{min: number, max: number}|null}
+ */
+function declaredRange(d, index, limitLow, limitHigh) {
+  const min = pickTagValue(d.sMinSampleValue, index, null);
+  const max = pickTagValue(d.sMaxSampleValue, index, null);
+  if (min === null || max === null) return null;
+
+  const lo = Number(min);
+  const hi = Number(max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+
+  if (limitLow !== null && (lo < limitLow || hi > limitHigh)) return null;
+
+  return { min: lo, max: hi };
+}
+
+/** Container bounds of an integer channel, which its declared range must fit inside. */
+function integerLimits(bits, isSigned) {
+  return isSigned
+    ? [-Math.pow(2, bits - 1), Math.pow(2, bits - 1) - 1]
+    : [0, Math.pow(2, bits) - 1];
+}
+
+/**
  * @typedef {Object} ChannelEncoding
  * @property {number} scale   Divisor applied to the raw sample.
  * @property {number} offset  Subtracted from the raw sample before dividing.
@@ -89,13 +129,30 @@ export function readSampleRangeTags(fileDirectory) {
 /**
  * Resolve the declared encoding of every channel of a TIFF plane.
  *
- *   SampleFormat 1 (uint)  -> scale = 2^b - 1,     offset = 0
- *   SampleFormat 2 (int)   -> scale = 2^(b-1) - 1, offset = 0, signed
- *   SampleFormat 3 (float) -> scale = (SMax - SMin) || 1, offset = SMin
- *   SampleFormat 4/5/6     -> throws
+ * A usable SMinSampleValue/SMaxSampleValue pair always wins, whatever the sample format:
  *
- * A float plane without SMin/SMax tags resolves to the identity transform, i.e. the
- * file is taken at its word.
+ *   any format, valid SMin/SMax -> scale = SMax - SMin,  offset = SMin
+ *   SampleFormat 1 (uint)       -> scale = 2^b - 1,      offset = 0
+ *   SampleFormat 2 (int)        -> scale = 2^(b-1) - 1,  offset = 0, signed
+ *   SampleFormat 3 (float)      -> identity, signed
+ *   SampleFormat 4/5/6          -> throws
+ *
+ * Honouring those tags on the INTEGER branches is what makes sub-container depths render:
+ * 10/12/14-bit sensors are stored as `BitsPerSample=16`, which is how essentially every
+ * scientific and clinical camera writes them, and normalizing such a plane against 65535
+ * renders it at a sixteenth of its intended brightness. See {@link declaredRange} for
+ * what makes a pair usable.
+ *
+ * `signed` reports whether the NORMALIZED range is [-1,1] rather than [0,1], so a
+ * declared range always clears it: mapping through [SMin, SMax] lands in [0,1] no matter
+ * how the samples were stored.
+ *
+ * What this deliberately does NOT do is look at pixels. A file that merely *happens* to
+ * use little of its declared range is indistinguishable from a dim scene, and guessing
+ * from samples would make `scale` depend on which tiles decoded first, bake that guess
+ * into the tile cache, and destroy the one property this module promises: that a
+ * normalized value means the same thing everywhere in the pyramid. Recovering those
+ * files is a display-side concern (window/level), not a decode-side one.
  *
  * @param {Object} desc
  * @param {number[]|number} [desc.bitsPerSample]
@@ -129,19 +186,42 @@ export function resolveSampleEncoding(desc) {
     let signed = false;
 
     switch (sampleFormatValue) {
-      case SAMPLE_FORMAT.UINT:
-        scale = Math.pow(2, bits) - 1;
+      case SAMPLE_FORMAT.UINT: {
+        const declared = declaredRange(d, i, ...integerLimits(bits, false));
+        if (declared) {
+          scale = declared.max - declared.min;
+          offset = declared.min;
+        } else {
+          scale = Math.pow(2, bits) - 1;
+        }
         break;
-      case SAMPLE_FORMAT.INT:
-        scale = Math.pow(2, bits - 1) - 1;
-        signed = true;
+      }
+      case SAMPLE_FORMAT.INT: {
+        const declared = declaredRange(d, i, ...integerLimits(bits, true));
+        if (declared) {
+          // A declared range maps onto [0,1], so the plane is no longer bipolar and
+          // `signed` must say so -- it describes the *normalized* range, not the
+          // storage type.
+          scale = declared.max - declared.min;
+          offset = declared.min;
+        } else {
+          scale = Math.pow(2, bits - 1) - 1;
+          signed = true;
+        }
         break;
+      }
       case SAMPLE_FORMAT.FLOAT: {
-        const sMin = pickTagValue(d.sMinSampleValue, i, 0);
-        const sMax = pickTagValue(d.sMaxSampleValue, i, null);
-        scale = (sMax === null ? 0 : sMax - sMin) || 1;
-        offset = sMin;
-        signed = true;
+        // Same rule as the integer branches, minus the container bounds -- a float has
+        // none. Without a usable range the file is taken at its word: identity transform,
+        // and the values may be negative.
+        const declared = declaredRange(d, i, null, null);
+        if (declared) {
+          scale = declared.max - declared.min;
+          offset = declared.min;
+        } else {
+          scale = 1;
+          signed = true;
+        }
         break;
       }
       default:

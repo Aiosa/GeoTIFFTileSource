@@ -10,10 +10,12 @@ import { installRawTiffPlugin } from "../src/formats/tiff.js";
 import {
   SAMPLE_ENCODING_VERSION,
   resolveSampleEncoding,
+  sampleToUnit,
 } from "../src/utils/tiffEncoding.js";
 
 import {
   fixtureGray8,
+  fixtureGray12in16,
   fixtureGray16,
   fixtureGrayFloat32,
   fixtureGrayFloat32Ranged,
@@ -68,16 +70,104 @@ describe("resolveSampleEncoding", () => {
   });
 
   it("uses SMin/SMax for float samples and falls back to identity without them", () => {
+    // A declared range lands in [0,1], so `signed` clears -- same rule as the integer
+    // branches, since it describes the normalized range and not the storage type.
     const ranged = resolveSampleEncoding({
       bitsPerSample: [32],
       sampleFormat: [3],
       sMinSampleValue: [-1],
       sMaxSampleValue: [3],
     });
-    expect(ranged.channels[0]).toMatchObject({ scale: 4, offset: -1, signed: true });
+    expect(ranged.channels[0]).toMatchObject({ scale: 4, offset: -1, signed: false });
 
+    // Without a usable range the file is taken at its word, and may be negative.
     const plain = resolveSampleEncoding({ bitsPerSample: [32], sampleFormat: [3] });
-    expect(plain.channels[0]).toMatchObject({ scale: 1, offset: 0 });
+    expect(plain.channels[0]).toMatchObject({ scale: 1, offset: 0, signed: true });
+  });
+
+  it("rejects float SMin/SMax as a pair, never half of one", () => {
+    const identity = { scale: 1, offset: 0, signed: true };
+
+    // Inverted, empty, non-finite, and a lone bound: each must fall back to identity.
+    // Applying the offset without the scale would shift the plane without rescaling it.
+    for (const tags of [
+      { sMinSampleValue: [3], sMaxSampleValue: [-1] },
+      { sMinSampleValue: [2], sMaxSampleValue: [2] },
+      { sMinSampleValue: [0], sMaxSampleValue: [NaN] },
+      { sMinSampleValue: [-1] },
+      { sMaxSampleValue: [3] },
+    ]) {
+      const enc = resolveSampleEncoding({ bitsPerSample: [32], sampleFormat: [3], ...tags });
+      expect(enc.channels[0]).toMatchObject(identity);
+    }
+  });
+
+  it("uses SMin/SMax for integer samples, which is what makes 12-in-16 render", () => {
+    // The case this exists for: 12-bit data in a uint16 container. Against the bit
+    // depth it peaks at 4095/65535 and renders as a black frame.
+    const twelveInSixteen = resolveSampleEncoding({
+      bitsPerSample: [16],
+      sampleFormat: [1],
+      sMinSampleValue: [0],
+      sMaxSampleValue: [4095],
+    });
+    expect(twelveInSixteen.channels[0]).toMatchObject({ scale: 4095, offset: 0, signed: false });
+    expect(sampleToUnit(4095, twelveInSixteen.channels[0])).toBe(1);
+
+    // A non-zero floor is carried as the offset, not folded into the scale.
+    const offsetRange = resolveSampleEncoding({
+      bitsPerSample: [16],
+      sampleFormat: [1],
+      sMinSampleValue: [1000],
+      sMaxSampleValue: [5000],
+    });
+    expect(offsetRange.channels[0]).toMatchObject({ scale: 4000, offset: 1000 });
+    expect(sampleToUnit(3000, offsetRange.channels[0])).toBe(0.5);
+
+    // A declared range makes a signed plane unipolar, and `signed` describes the
+    // normalized range rather than the storage type.
+    const signedRanged = resolveSampleEncoding({
+      bitsPerSample: [16],
+      sampleFormat: [2],
+      sMinSampleValue: [-2000],
+      sMaxSampleValue: [2000],
+    });
+    expect(signedRanged.channels[0]).toMatchObject({ scale: 4000, offset: -2000, signed: false });
+    expect(sampleToUnit(0, signedRanged.channels[0])).toBe(0.5);
+
+    // Per-channel tags are honoured independently.
+    const perChannel = resolveSampleEncoding({
+      bitsPerSample: [16, 16],
+      sampleFormat: [1, 1],
+      sMinSampleValue: [0, 0],
+      sMaxSampleValue: [4095, 65535],
+    });
+    expect(perChannel.channels[0].scale).toBe(4095);
+    expect(perChannel.channels[1].scale).toBe(65535);
+  });
+
+  it("rejects integer SMin/SMax that the writer disagreed with itself about", () => {
+    const bitDepthRange = { scale: 65535, offset: 0, signed: false };
+
+    // Inverted, empty, out of bit-depth reach, and non-finite: each falls back to the
+    // bit-depth range rather than produce something worse than no tag at all.
+    for (const [min, max] of [[4095, 0], [100, 100], [0, 70000], [-5, 4095], [0, NaN]]) {
+      const enc = resolveSampleEncoding({
+        bitsPerSample: [16],
+        sampleFormat: [1],
+        sMinSampleValue: [min],
+        sMaxSampleValue: [max],
+      });
+      expect(enc.channels[0]).toMatchObject(bitDepthRange);
+    }
+
+    // One tag alone says nothing about the range.
+    const halfDeclared = resolveSampleEncoding({
+      bitsPerSample: [16],
+      sampleFormat: [1],
+      sMaxSampleValue: [4095],
+    });
+    expect(halfDeclared.channels[0]).toMatchObject(bitDepthRange);
   });
 
   it("resolves per channel, not per file", () => {
@@ -173,6 +263,26 @@ describe("declared encoding of GPU packs", () => {
       expect(value).toBeGreaterThanOrEqual(-1);
       expect(value).toBeLessThanOrEqual(1);
     }
+  });
+
+  it("normalizes 12-bit-in-uint16 against its declared range, end to end", async () => {
+    // Proves the tags survive geotiff.js parsing and the worker boundary, which the
+    // resolveSampleEncoding unit tests cannot: they are read off fileDirectory, and this
+    // fixture writes them as SHORT (the spec type for an integer image), not FLOAT.
+    const tex = await pack(fixtureGray12in16());
+
+    expect(tex.encoding.channels[0]).toMatchObject({ scale: 4095, offset: 0, bits: 16 });
+    expect(tex.packs[0].scale[0]).toBe(4095);
+
+    for (const [x, y] of [[0, 0], [3, 2], [15, 15]]) {
+      // sample = patternByte * 16, declared max 4095 -> unit = byte * 16 / 4095
+      const value = componentAt(tex, x, y, 0);
+      expect(value).toBeCloseTo((patternByte(x, y, 0) * 16) / 4095, 3);
+      expect(value).toBeLessThanOrEqual(1);
+    }
+
+    // Against the bit depth the brightest pixel would sit at 0.062 -- a black frame.
+    expect(componentAt(tex, 15, 15, 0)).toBeGreaterThan(0.5);
   });
 
   it("normalizes float32 through SMinSampleValue/SMaxSampleValue", async () => {

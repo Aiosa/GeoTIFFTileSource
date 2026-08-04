@@ -57,8 +57,9 @@ function buildTIFF({
                      pixelBytes, // Uint8Array of image data in the chosen layout
                      imageDescription = null,
                      sampleFormatArray = null, // optional tag 339
-                     sMinSampleValue = null,   // optional tag 340 (float fixtures)
-                     sMaxSampleValue = null,   // optional tag 341 (float fixtures)
+                     sMinSampleValue = null,   // optional tag 340
+                     sMaxSampleValue = null,   // optional tag 341
+                     sampleRangeType = TYPE.FLOAT, // type of tags 340/341
                    }) {
   // Header (8 bytes):
   // II (little endian), 42, offset to first IFD (we'll place IFD right after header + pixel data)
@@ -164,13 +165,17 @@ function buildTIFF({
     entries.push(shortArrayEntry(339, sampleFormatArray));
   }
 
-  // SMinSampleValue / SMaxSampleValue (340/341), written as FLOAT
-  const floatArrayEntry = (tag, values) => (values.length === 1
-    ? writeIFDEntry(tag, TYPE.FLOAT, 1, f32Bits(values[0]))
-    : writeIFDEntry(tag, TYPE.FLOAT, values.length, 0)); // offset patched below
+  // SMinSampleValue / SMaxSampleValue (340/341). The spec says these carry the same type
+  // as the samples, so an integer image writes SHORT and only a float image writes FLOAT.
+  const rangeEntry = (tag, values) => {
+    if (sampleRangeType === TYPE.SHORT) return shortArrayEntry(tag, values);
+    return values.length === 1
+      ? writeIFDEntry(tag, TYPE.FLOAT, 1, f32Bits(values[0]))
+      : writeIFDEntry(tag, TYPE.FLOAT, values.length, 0); // offset patched below
+  };
 
-  if (sMinSampleValue) entries.push(floatArrayEntry(340, sMinSampleValue));
-  if (sMaxSampleValue) entries.push(floatArrayEntry(341, sMaxSampleValue));
+  if (sMinSampleValue) entries.push(rangeEntry(340, sMinSampleValue));
+  if (sMaxSampleValue) entries.push(rangeEntry(341, sMaxSampleValue));
 
   // Build IFD block
   const ifdStart = buf.length;
@@ -205,8 +210,13 @@ function buildTIFF({
 
   patchShortArray(258, bitsPerSampleArray);
   patchShortArray(339, sampleFormatArray);
-  patchFloatArray(340, sMinSampleValue);
-  patchFloatArray(341, sMaxSampleValue);
+  if (sampleRangeType === TYPE.SHORT) {
+    patchShortArray(340, sMinSampleValue);
+    patchShortArray(341, sMaxSampleValue);
+  } else {
+    patchFloatArray(340, sMinSampleValue);
+    patchFloatArray(341, sMaxSampleValue);
+  }
 
   // Patch ImageDescription
   if (descBytes) {
@@ -389,6 +399,27 @@ export function fixtureGray16({ width = 16, height = 16 } = {}) {
     planarConfiguration: 1,
     pixelBytes: makeTypedPattern(width, height, 1, Uint16Array, (b) => b * 257),
     imageDescription: "fixture: gray16",
+  });
+}
+
+// 12-bit data in a uint16 container, declaring its real range through SMax -- how
+// essentially every scientific and clinical camera writes sub-container depths.
+// Against the bit depth this peaks at 4095/65535 and renders as a black frame.
+export function fixtureGray12in16({ width = 16, height = 16 } = {}) {
+  return buildTIFF({
+    width,
+    height,
+    samplesPerPixel: 1,
+    bitsPerSampleArray: [16],
+    sampleFormatArray: [1],
+    sMinSampleValue: [0],
+    sMaxSampleValue: [4095],
+    sampleRangeType: TYPE.SHORT,
+    photometric: 1,
+    planarConfiguration: 1,
+    // byte * 16 spans 0..4080, inside the declared 12-bit range
+    pixelBytes: makeTypedPattern(width, height, 1, Uint16Array, (b) => b * 16),
+    imageDescription: "fixture: 12-bit in uint16",
   });
 }
 

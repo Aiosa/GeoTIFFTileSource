@@ -9,6 +9,7 @@ import { enableGeoTIFFTileSource } from "../src/main.js";
 import { installRawTiffPlugin } from "../src/formats/tiff.js";
 import {
   SAMPLE_ENCODING_VERSION,
+  channelEncodingAt,
   resolveSampleEncoding,
   sampleToUnit,
 } from "../src/utils/tiffEncoding.js";
@@ -22,6 +23,7 @@ import {
   fixtureGrayInt16,
   fixtureGrayUndefinedFormat,
   fixtureRGB8Chunky,
+  fixtureRGB8Ranged,
   fixtureRGB16Chunky,
   patternByte,
 } from "./data/tiff-fixtures.js";
@@ -188,6 +190,24 @@ describe("resolveSampleEncoding", () => {
   });
 });
 
+describe("channelEncodingAt", () => {
+  it("returns identity for a channel the file does not declare", () => {
+    // A bad format.channels naming band 7 of a 2-band file. Substituting band 0's
+    // transform would normalize against the wrong range while looking like an answer.
+    const encoding = resolveSampleEncoding({
+      bitsPerSample: [16, 16],
+      sampleFormat: [1, 1],
+      sMinSampleValue: [0, 0],
+      sMaxSampleValue: [4095, 4095],
+      samplesPerPixel: 2,
+    });
+
+    expect(channelEncodingAt(encoding, 1).scale).toBe(4095);
+    expect(channelEncodingAt(encoding, 7)).toMatchObject({ scale: 1, offset: 0, bits: 8 });
+    expect(channelEncodingAt(null, 0)).toMatchObject({ scale: 1, offset: 0 });
+  });
+});
+
 describe("bit-depth-aware interpretation", () => {
   /** @type {*} */
   let api;
@@ -301,6 +321,35 @@ describe("declared encoding of GPU packs", () => {
     }
   });
 
+  it("honours a declared range on 8-bit samples, on both paths, end to end", async () => {
+    // 8-bit RGB whose SMax says 200. Shallow enough for the image path, but its bytes are
+    // not display bytes -- and its raw bytes must not reach an RGBA8 texture either.
+    const asData = await api.convert(
+      {},
+      wrapRaw(fixtureRGB8Ranged(), { format: { interpretation: "data" } }),
+      "gpuTextureSet"
+    );
+    expect(asData.encoding.channels[0]).toMatchObject({ scale: 200, offset: 0, bits: 8 });
+    expect(asData.packs[0].format).toBe("RGBA16F");
+    for (let c = 0; c < 3; c++) {
+      // raw = round(byte * 200 / 255), scale = 200 => unit == byte / 255
+      expect(componentAt(asData, 4, 1, c)).toBeCloseTo(patternByte(4, 1, c) / 255, 2);
+    }
+
+    // The image path resolves by bit depth, so this file still renders as a picture --
+    // rescaled onto the full 0..255, not left at 78% brightness.
+    const asImage = await api.convert(
+      {},
+      wrapRaw(fixtureRGB8Ranged(), { format: { interpretation: "auto" } }),
+      "gpuTextureSet"
+    );
+    expect(asImage.mode).toBe("image");
+    expect(asImage.packs[0].format).toBe("RGBA8");
+    for (let c = 0; c < 3; c++) {
+      expect(componentAt(asImage, 4, 1, c)).toBeCloseTo(patternByte(4, 1, c) / 255, 2);
+    }
+  });
+
   it("keeps image-mode packs in [0,1] under forceRGBA16F", async () => {
     const tex = await api.convert(
       {},
@@ -330,7 +379,10 @@ describe("pack lanes and RGBA8 selection", () => {
    * Build a raster with arbitrary tags. Conversion transfers the band buffers, so this
    * must produce a fresh raster per call.
    */
-  const raster = ({ bands, bitsPerSample = [8], sampleFormat = null, photometric, colorMap = null, format }) =>
+  const raster = ({
+    bands, bitsPerSample = [8], sampleFormat = null, photometric,
+    colorMap = null, format, fileDirectory = {},
+  }) =>
     new api.TiffRaster({
       width: 4,
       height: 1,
@@ -340,7 +392,7 @@ describe("pack lanes and RGBA8 selection", () => {
       sampleFormat,
       photometricInterpretation: photometric,
       colorMap,
-      fileDirectory: {},
+      fileDirectory,
       hints: format ? { format } : {},
     });
 
@@ -364,6 +416,25 @@ describe("pack lanes and RGBA8 selection", () => {
     const tex = await packRaster({ bands: [band([0, 1, 2, 3])], bitsPerSample: [8], sampleFormat: [1] });
     expect(tex.packs[0].format).toBe("RGBA8");
     expect(tex.packs[0].scale[0]).toBe(255);
+  });
+
+  it("keeps an 8-bit channel with a declared range OFF the RGBA8 fast path", async () => {
+    // RGBA8 stores the raw byte and leans on the sampler's divide by 255. With a declared
+    // scale of 200 that divide is the wrong transform, so the texture would contradict the
+    // scale stamped beside it: raw 200 would sample as 0.784 where the contract says 1.
+    const tex = await packRaster({
+      bands: [band([0, 100, 200, 200])],
+      bitsPerSample: [8],
+      sampleFormat: [1],
+      fileDirectory: { SMinSampleValue: [0], SMaxSampleValue: [200] },
+    });
+
+    expect(tex.encoding.channels[0]).toMatchObject({ scale: 200, offset: 0, bits: 8 });
+    expect(tex.packs[0].format).toBe("RGBA16F");
+    expect(tex.packs[0].scale[0]).toBe(200);
+    expect(componentAt(tex, 0, 0, 0)).toBeCloseTo(0, 5);
+    expect(componentAt(tex, 1, 0, 0)).toBeCloseTo(0.5, 3);
+    expect(componentAt(tex, 2, 0, 0)).toBeCloseTo(1, 3);
   });
 
   it("fills the alpha lane of a short pack with opaque", async () => {
@@ -420,13 +491,14 @@ describe("pack lanes and RGBA8 selection", () => {
 });
 
 describe("plugin defaults", () => {
+  const osdStub = () => ({
+    converter: { learn() {} },
+    console: { warn() {}, error() {} },
+    supportsAsync: true,
+  });
+
   it("merges defaults.format instead of replacing it", () => {
-    const stub = {
-      converter: { learn() {} },
-      console: { warn() {}, error() {} },
-      supportsAsync: true,
-    };
-    const api = installRawTiffPlugin(stub, {
+    const api = installRawTiffPlugin(osdStub(), {
       defaults: { format: { interpretation: "data" } },
       workerPool: { enabled: false },
     });
@@ -436,6 +508,28 @@ describe("plugin defaults", () => {
     expect(api.defaults.format.gpu.preferRGBA8).toBe(true);
     expect(api.defaults.format.gpu.padAlpha).toBe(1);
     expect(api.defaults.format.hints.layout.pyramid).toBe("auto");
+  });
+
+  it("folds a second install's defaults in rather than dropping them", () => {
+    // enableGeoTIFFTileSource() calls installRawTiffPlugin() every time, but the plugin
+    // can only be built once. A second call's defaults used to vanish silently while its
+    // httpAdapter took effect -- half the configuration applied, with no warning.
+    const stub = osdStub();
+    const first = installRawTiffPlugin(stub, {
+      defaults: { format: { interpretation: "data" } },
+      workerPool: { enabled: false },
+    });
+    const toneMap = () => 0;
+    const second = installRawTiffPlugin(stub, {
+      defaults: { toneMap, format: { gpu: { padAlpha: 0 } } },
+    });
+
+    expect(second).toBe(first);
+    expect(second.defaults.toneMap).toBe(toneMap);
+    expect(second.defaults.format.gpu.padAlpha).toBe(0);
+    // the first install's choices, and the untouched defaults, both survive
+    expect(second.defaults.format.interpretation).toBe("data");
+    expect(second.defaults.format.gpu.preferRGBA8).toBe(true);
   });
 });
 
@@ -528,6 +622,12 @@ describe("GeoTIFFTileSource surface", () => {
     const source = new OpenSeadragon.GeoTIFFTileSource(asFile(fixtureRGB8Chunky()));
     await source.promises.ready.promise;
     expect(source.getTiffDescriptor().interpretationResolved).toBe("image");
+  });
+
+  it("applies the constructor default only when the caller states nothing", async () => {
+    const source = new OpenSeadragon.GeoTIFFTileSource(asFile(fixtureGray8()));
+    await source.promises.ready.promise;
+    expect(source.options.logLatency).toBe(false);
   });
 
   it("matches TIFF urls and magic bytes for autodetection", () => {

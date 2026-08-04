@@ -386,6 +386,28 @@ function makeTypedPattern(width, height, spp, Ctor, mapValue) {
   return new Uint8Array(out.buffer);
 }
 
+// 8-bit unsigned, 3 samples, declaring a sub-container range through SMin/SMax. The
+// samples are genuinely 8-bit and land in a Uint8Array, so nothing but the declared range
+// stops this from taking the RGBA8 fast path -- where the sampler's divide by 255 would
+// contradict the scale of 200 stamped on the pack.
+export function fixtureRGB8Ranged({ width = 16, height = 16 } = {}) {
+  return buildTIFF({
+    width,
+    height,
+    samplesPerPixel: 3,
+    bitsPerSampleArray: [8, 8, 8],
+    sampleFormatArray: [1, 1, 1],
+    sMinSampleValue: [0, 0, 0],
+    sMaxSampleValue: [200, 200, 200],
+    sampleRangeType: TYPE.SHORT,
+    photometric: 2, // RGB
+    planarConfiguration: 1,
+    // byte * 200 / 255 spans 0..200, inside the declared range
+    pixelBytes: makeTypedPattern(width, height, 3, Uint8Array, (b) => Math.round((b * 200) / 255)),
+    imageDescription: "fixture: rgb8 with declared range",
+  });
+}
+
 // 16-bit unsigned grayscale. sample = byte * 257, i.e. the 8-bit pattern stretched over
 // the full 16-bit range, so the expected unit value is exactly byte / 255.
 export function fixtureGray16({ width = 16, height = 16 } = {}) {

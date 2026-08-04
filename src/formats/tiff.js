@@ -339,7 +339,20 @@ function __rt_reviveGpuTextureSetPayload(p) {
 export function installRawTiffPlugin(OpenSeadragon, opts = {}) {
   const $ = OpenSeadragon;
 
-  if ($.RawTiffPlugin && $.RawTiffPlugin.__installed) return $.RawTiffPlugin;
+  if ($.RawTiffPlugin && $.RawTiffPlugin.__installed) {
+    // The plugin cannot be rebuilt -- its converters are already registered with
+    // OpenSeadragon -- but dropping the caller's defaults on the floor is worse than
+    // folding them into the ones already in force. The closures below read these
+    // properties at call time, so mutating them in place is what takes effect.
+    const existing = $.RawTiffPlugin.defaults;
+    if (opts.defaults && existing) {
+      if (opts.defaults.toneMap !== undefined) existing.toneMap = opts.defaults.toneMap;
+      if (opts.defaults.format) {
+        existing.format = deepMerge(existing.format, opts.defaults.format);
+      }
+    }
+    return $.RawTiffPlugin;
+  }
 
   // Merge AFTER the assign: a caller's raw `format` would otherwise overwrite the merged
   // one wholesale, dropping every default key it did not restate.

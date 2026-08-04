@@ -17,10 +17,9 @@ import { Converters } from "../utils/Converters.js";
 import {
   PHOTOMETRIC,
   SAMPLE_ENCODING_VERSION,
-  SAMPLE_FORMAT,
   channelEncodingAt,
   inferInterpretation,
-  isDisplayReadyChannel,
+  isIdentityChannel,
   readSampleRangeTags,
   resolveSampleEncoding,
   sampleToByte,
@@ -198,12 +197,14 @@ function rasterToRGBA8_ImageMode(raster, hints, format) {
   const photometric = raster.photometricInterpretation;
   const encoding = rasterEncoding(raster);
 
-  // Display bytes for one band. 8-bit integer bands are passed through untouched.
+  // Display bytes for one band. Only bands whose declared transform is already the
+  // identity are passed through untouched -- an 8-bit band that declares SMin/SMax is
+  // shallow enough for this path but still has to be rescaled onto 0..255.
   const bandBytes = (bandIndex) => {
     const band = raster.bands[bandIndex];
     if (!band) return null;
     const ch = channelEncodingAt(encoding, bandIndex);
-    if (isDisplayReadyChannel(ch) &&
+    if (isIdentityChannel(ch) &&
         (band instanceof Uint8Array || band instanceof Uint8ClampedArray)) {
       return band;
     }
@@ -398,17 +399,20 @@ function packBandsAsData(raster, format) {
     : [...Array(bandCount).keys()];
   const channelCount = channels.filter((c) => c != null && c >= 0).length;
 
-  // Decide RGBA8 vs RGBA16F. The channel must genuinely be 8-bit unsigned, not merely
-  // arrive in a Uint8Array: geotiff.js unpacks 1/2/4-bit samples into one too, and a
-  // texture the sampler divides by 255 would then contradict its declared scale.
-  const allDisplayReady = channels.every((c) => {
+  // Decide RGBA8 vs RGBA16F. RGBA8 stores the raw byte and leans on the sampler's
+  // divide by 255 to satisfy the contract, so it is only correct when the declared
+  // transform IS that divide. Two ways it is not:
+  //  - the channel is not 8-bit unsigned (geotiff.js unpacks 1/2/4-bit samples into a
+  //    Uint8Array too, so the array type alone proves nothing), or
+  //  - the file declares SMin/SMax, making scale/offset something other than 255/0.
+  // Either way the texture would contradict the scale stamped beside it.
+  const allIdentity = channels.every((c) => {
     if (c == null || c < 0) return true; // padding lane, no constraint
-    const ch = channelEncodingAt(encoding, c);
     const band = raster.bands[c];
-    return ch.bits === 8 && ch.sampleFormat === SAMPLE_FORMAT.UINT &&
+    return isIdentityChannel(channelEncodingAt(encoding, c)) &&
       (band instanceof Uint8Array || band instanceof Uint8ClampedArray);
   });
-  const useRGBA8 = preferRGBA8 && !forceRGBA16F && allDisplayReady;
+  const useRGBA8 = preferRGBA8 && !forceRGBA16F && allIdentity;
 
   const packs = [];
   for (let p = 0; p < channels.length; p += 4) {

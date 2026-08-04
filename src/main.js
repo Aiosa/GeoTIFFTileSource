@@ -1,13 +1,20 @@
-import { fromBlob, fromUrl, fromCustomClient, BaseClient, BaseResponse, globals, Pool } from "geotiff";
+import { fromBlob, fromUrl, fromCustomClient, globals, Pool } from "geotiff";
 import { PromiseWrapper } from "./utils/PromiseWrapper.js";
 import { logOnce } from "./utils/consoleOnce.js"
 import { parsePerkinElmerChannels } from "./formats/perkinElmer.js";
 import { installRawTiffPlugin } from "./formats/tiff.js";
 import {
   inferInterpretation,
+  isIdentityChannel,
   readSampleRangeTags,
   resolveSampleEncoding,
 } from "./utils/tiffEncoding.js";
+import {
+  HTTP_CLIENT,
+  makeAdapterClientCtor,
+  transportMark,
+  withTransportCause,
+} from "./utils/httpAdapterClient.js";
 
 import * as gtiff from "geotiff";
 window.GeoTIFF = gtiff;
@@ -22,6 +29,8 @@ window.GeoTIFF = gtiff;
  * @param {String} options.workerUrl - URL of the worker script to use for GeoTIFF conversion. Defaults to the worker script bundled with this library.
  * @param {Object} options.workerPool - Worker pool to use for GeoTIFF conversion. Defaults to a new pool created for this instance.
  * @param {Object} [options.httpAdapter] - Optional HTTP adapter for routing all geotiff.js range requests through a custom transport (auth, proxy, retry). Shape: `{ fetch(url, init?) => Promise<Response> }`. When omitted, geotiff.js uses the global `fetch`.
+ * @param {Function} options.httpAdapter.fetch - Invoked for every byte-range request, with the `Range` header and an `AbortSignal` already set on `init`.
+ * @param {Boolean} [options.httpAdapter.captureErrorBody=false] - Echo a failed response's body into the reported error message. Off by default: error bodies routinely carry tokens and user data, and the message reaches console logs and the `open-failed` event payload.
  * @param {Object} [options.defaults] - Plugin-wide defaults forwarded to installRawTiffPlugin.
  * @param {Object} [options.defaults.format] - Default {@link FormatOptions} merged into every conversion.
  * @param {Function} [options.defaults.toneMap] - Override for the CPU renderer's sample -> display byte mapping.
@@ -41,27 +50,29 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
     defaults,      // optional: { format, toneMap }
   } = options;
 
-  const AdapterClientCtor = httpAdapter
-    ? (() => {
-        class AdapterResponse extends BaseResponse {
-          constructor(res) { super(); this.res = res; }
-          get status()    { return this.res.status; }
-          getHeader(name) { return this.res.headers.get(name); }
-          async getData() { return this.res.arrayBuffer(); }
-        }
-        return class AdapterClient extends BaseClient {
-          async request({ headers, signal } = {}) {
-            const res = await httpAdapter.fetch(this.url, { headers, signal });
-            return new AdapterResponse(res);
-          }
-        };
-      })()
-    : null;
+  const AdapterClientCtor = makeAdapterClientCtor(httpAdapter);
 
-  const openRemote = (url, geotiffOptions) =>
-    AdapterClientCtor
-      ? fromCustomClient(new AdapterClientCtor(url), geotiffOptions)
-      : fromUrl(url, geotiffOptions);
+  /**
+   * Open a remote GeoTIFF through the configured transport.
+   *
+   * The adapter branch does two things beyond calling geotiff.js: it replaces the
+   * opaque error geotiff.js produces on failure with the transport failure that
+   * caused it, and it parks the client on the resolved GeoTIFF so a later tile read
+   * can do the same. See utils/httpAdapterClient.js for why that is necessary.
+   */
+  const openRemote = (url, geotiffOptions) => {
+    if (!AdapterClientCtor) return fromUrl(url, geotiffOptions);
+
+    const client = new AdapterClientCtor(url);
+    const mark = transportMark(client);
+    return fromCustomClient(client, geotiffOptions).then(
+      (tiff) => {
+        Object.defineProperty(tiff, HTTP_CLIENT, { value: client, enumerable: false });
+        return tiff;
+      },
+      (error) => { throw withTransportCause(client, mark, error); }
+    );
+  };
 
   const defaultCreateWorker = () => {
     // If caller passed a specific URL, use it directly
@@ -139,17 +150,22 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
       GeoTIFFTileSource._sharedPool = pool;
     }
 
-    constructor(input, opts = { logLatency: false }) {
+    constructor(input, opts = {}) {
       // keep a reference to which instance we are; this will be unique for different sources.
       const instanceId = tsCounter++;
 
       // Options-object form: what OSD autodetection hands us (see configure()) and what
-      // callers pass when they want options and a url in one object.
+      // callers pass when they want options and a url in one object. The plugin defaults
+      // go in FIRST so the config object can override them -- putting them in `opts`'s
+      // default value instead would let `new GeoTIFFTileSource({url, logLatency: true})`
+      // be silently overruled by a default nobody asked for.
       const isFile = typeof File !== "undefined" && input instanceof File;
       if (input && typeof input === "object" && !isFile &&
           !input.GeoTIFF && typeof input.url === "string") {
-        opts = Object.assign({}, input, opts);
+        opts = Object.assign({ logLatency: false }, input, opts);
         input = input.url;
+      } else {
+        opts = Object.assign({ logLatency: false }, opts);
       }
 
       // Construct through OpenSeadragon's url branch. It installs safe defaults, leaves
@@ -216,7 +232,7 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
             this.setupLevels();
           })
           .catch((error) => {
-            console.error("Re-throwing error with GeoTIFF:", error);
+            OpenSeadragon.console.error("Failed to open GeoTIFF:", error);
             // The source stays not-ready, so anything awaiting it must be told, or it
             // waits forever. OSD's waitUntilReady listens for exactly this event.
             self.promises.ready.promise.catch(() => { /* nobody may be awaiting it */ });
@@ -225,7 +241,9 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
               message: error && error.message ? error.message : String(error),
               source: self.url,
             });
-            throw error;
+            // Deliberately NOT re-thrown: this chain is not assigned anywhere, so a
+            // re-throw only produces an unhandled rejection. The error already reached
+            // the caller through promises.ready and the 'open-failed' event.
           });
       }
     }
@@ -256,8 +274,9 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
       const target = (typeof data === "string" && data) ||
         (data && typeof data === "object" && typeof data.url === "string" && data.url) ||
         url;
+      // `.ome.tiff` needs no branch of its own -- `tiff?` already matches its tail.
       if (typeof target === "string" &&
-          /\.(tiff?|qptiff|ome\.tiff?|btf|svs|ndpi|scn)(\?|#|$)/i.test(target)) {
+          /\.(tiff?|qptiff|btf|svs|ndpi|scn)(\?|#|$)/i.test(target)) {
         return true;
       }
 
@@ -497,6 +516,11 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
 
     setupComplete() {
       this._ready = true;
+      // OSD v6 flips this from its own high-priority 'ready' handler; OSD < v6 only sets it
+      // from the getImageInfo/configure flow, which this source deliberately does not use.
+      // Left false, a viewer that opens an already-ready source waits for a 'ready' event
+      // that has already fired, and never adds the tiled image.
+      this.ready = true;
       this.promises.ready.resolve();
 
       this.raiseEvent("ready", { tileSource: this });
@@ -609,6 +633,49 @@ export const enableGeoTIFFTileSource = (OpenSeadragon, options={}) => {
      */
     getSampleEncoding() {
       return this.getTiffDescriptor().encoding;
+    }
+
+    /**
+     * Precision this source's GPU packs will carry, answered from the header alone.
+     *
+     * Optional renderer contract (FlexRenderer's `precision: "auto"` negotiation): the
+     * renderer sizes its first-pass colour target from what the data declares, and would
+     * otherwise discover that from the first prepared tile -- costing a program rebuild
+     * and a texture reallocation mid-load. Answering here gets the target right before
+     * the first tile decodes.
+     *
+     * Mirrors the packing decision in the worker (`packCanonicalRGBA` / `packBandsAsData`):
+     * RGBA8 only where the declared transform IS the sampler's divide by 255. A wrong guess
+     * here is harmless -- the prepared tile is authoritative and corrects it.
+     *
+     * @returns {"unorm8"|"float16"|undefined} undefined while the header is unread
+     */
+    getTileDataPrecision() {
+      if (!this._ready) return undefined;
+
+      const gpu = (this.format && this.format.gpu) || {};
+      if (gpu.forceRGBA16F || gpu.preferRGBA8 === false) return "float16";
+
+      let descriptor;
+      try {
+        descriptor = this.getTiffDescriptor();
+      } catch (e) {
+        return undefined;
+      }
+
+      // The image path renders to display bytes before packing, so it is 8-bit whatever
+      // the file held.
+      if (descriptor.interpretationResolved === "image") return "unorm8";
+
+      const channels = descriptor.channels || [];
+      const encodings = (descriptor.encoding && descriptor.encoding.channels) || [];
+      const allIdentity = channels.every((c) => {
+        if (c == null || c < 0) return true; // padding lane, no constraint
+        const enc = encodings[c];
+        return !!enc && isIdentityChannel(enc);
+      });
+
+      return allIdentity ? "unorm8" : "float16";
     }
 
     /**
@@ -895,6 +962,12 @@ high-resolution lowest level will be shown. Note that loading such data can cras
         }
       }
 
+      // Snapshot the transport's failure count so a failure raised by THIS read can be
+      // told from one that was already on the record. Undefined without an httpAdapter,
+      // in which case the handler below is a no-op.
+      const httpClient = this.GeoTIFF && this.GeoTIFF[HTTP_CLIENT];
+      const mark = transportMark(httpClient);
+
       // Key point: do NOT do raster -> RGBA conversion here.
       // Read planar rasters (interleave:false) and wrap as a tiffRaster type.
       return image.readRasters({
@@ -904,6 +977,10 @@ high-resolution lowest level will be shown. Note that loading such data can cras
         width: tileWidth,
         height: tileHeight,
         signal: abortSignal,
+      }).catch((error) => {
+        // Rethrown with its cause restored, so downloadTileStart's context.fail() and
+        // OSD's 'tile-load-failed' name the real problem instead of "Request failed".
+        throw withTransportCause(httpClient, mark, error);
       }).then((rasters) => {
         const bands = Array.isArray(rasters) ? rasters : [rasters];
 

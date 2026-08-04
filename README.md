@@ -4,6 +4,39 @@ Implementation of a [TileSource](https://openseadragon.github.io/docs/OpenSeadra
 
 See it in action at [https://pearcetm.github.io/GeoTIFFTileSource/demo/demo.html](https://pearcetm.github.io/GeoTIFFTileSource/demo/demo.html)
 
+## ⚠️ Breaking changes: `gpuTextureSet` encoding
+
+The `gpuTextureSet` contract changed. If you consume `gpuTextureSet` in a shader, **read this
+before upgrading**; if you only use the image-like types (`tiffRaster` → canvas/ImageBitmap),
+nothing below affects you.
+
+Texture sets now carry `encodingVersion: 1` and an `encoding` descriptor. Anything without an
+`encodingVersion` field predates this contract; branch on it if you need to support both.
+
+| | before | now |
+| --- | --- | --- |
+| `pack.normalized` | always `false` | always `true` |
+| `pack.scale` (image mode) | `[1,1,1,1]` | `[255,255,255,255]` |
+| `pack.scale` (data mode) | `1`, or the bit-depth max only when it overflowed half-float | always the channel's declared scale |
+| RGBA16F component range | raw sample values (`0..255` in image mode) | `[0,1]`, or `[-1,1]` when the channel reports `signed` |
+| unused alpha lane of a short pack | `0` (fully transparent) | `1` (opaque), configurable via [`format.gpu.padAlpha`](#formatgpu) |
+
+`scale`/`offset` are now the transform that **was applied**, not one you must apply: the stored
+component is `(rawSample - offset) / scale`, so recovering the original measurement means
+`stored * scale + offset`. A shader that previously multiplied by `scale` to *undo* an
+overflow-driven normalization now brightens image-mode packs 255×; drop that multiply, or apply
+it only when you want raw sample units back. See [Sample encoding](#sample-encoding).
+
+Two further behavior changes:
+
+- **`format.interpretation: "auto"` is now bit-depth aware.** 16-bit RGB, 16-bit grayscale and
+  float grayscale resolve to `"data"` where they previously resolved to `"image"` — the image
+  path builds an 8-bit RGBA buffer, which saturated those files to white or rendered them black.
+  Pass `format.interpretation: "image"` to force the old routing; it now rescales through the
+  declared encoding rather than truncating.
+- **`SampleFormat` 4, 5 and 6** (undefined / complex) now throw during decode instead of
+  rendering garbage.
+
 ## Local demo development (before pushing to GitHub Pages)
 
 The demo pages live under [`demo/`](demo/) and are served locally via Vite.
@@ -103,7 +136,7 @@ This will make the `OpenSeadragon.GeoTIFFTileSource` class available for use.
 | --- | --- | --- |
 | `workerUrl` | `string \| URL` | URL of the worker script used for GeoTIFF decoding. Defaults to the worker bundled with this library. |
 | `workerPool` | `{ createWorker: () => Worker }` | Custom worker pool. Defaults to a pool that uses `workerUrl`. |
-| `httpAdapter` | `{ fetch(url, init?) => Promise<Response> }` | Optional HTTP adapter routing **all** geotiff.js range requests through a custom transport. See below. |
+| `httpAdapter` | `{ fetch(url, init?) => Promise<Response>, captureErrorBody?: boolean }` | Optional HTTP adapter routing **all** geotiff.js range requests through a custom transport. See below. |
 | `defaults` | `{ format?, toneMap? }` | Plugin-wide defaults. `format` is merged into every conversion (see [Options](#options-format-gpu-packing-and-layout-hints)); `toneMap(value, bandIndex, raster)` overrides the CPU renderer's sample → display byte mapping. |
 
 ### Custom HTTP transport (`httpAdapter`)
@@ -132,6 +165,55 @@ Requirements for the returned `Response`:
 - Standard `Response` semantics — `arrayBuffer()` and `headers.get()` must work.
 
 When omitted, behavior is byte-identical to previous versions (geotiff.js's default `fetch` path).
+
+#### Error reporting
+
+When an adapter throws, or returns a status outside `2xx`, the failure is reported with its cause
+intact — as a `GeoTIFFTransportError`:
+
+```javascript
+viewer.addHandler("open-failed", (e) => console.error(e.message));
+
+// or, holding the source directly:
+try {
+  await tileSource.promises.ready.promise;
+} catch (err) {
+  err.name;         // "GeoTIFFTransportError"
+  err.message;      // your adapter's own message, or "[GeoTIFFTileSource] HTTP 401 for <url>"
+  err.status;       // 401 — or null when the adapter threw instead of responding
+  err.url;          // the url that failed
+  err.cause;        // the Error your adapter threw
+  err.geotiffError; // geotiff.js's original, opaque error, kept rather than discarded
+}
+```
+
+Tile failures carry the same error: it reaches `context.fail()` and therefore OpenSeadragon's
+`tile-load-failed` event. Aborted tiles are **not** reported this way — cancelling a tile raises a
+normal `AbortError` and is never mistaken for a transport failure.
+
+This matters because geotiff.js discards the cause twice on its way out: `RemoteSource` replaces any
+non-ok response with a bare `Error("Error fetching data.")`, dropping the status, and `BlockedSource`
+then collects its per-block promises with `Promise.allSettled` without ever reading `.reason`,
+throwing `AggregateError([undefined], "Request failed")`. Without the handling above, an app that
+added auth through an adapter could not tell an expired token from a missing file.
+
+> **This only applies when an `httpAdapter` is configured.** Without one, requests go through
+> geotiff.js's own transport, which this library cannot see into — every failure still arrives as
+> `Request failed`. If you need actionable failures, use an adapter.
+
+To include a failed response's body in the message — useful when a server explains itself in the
+body — opt in:
+
+```javascript
+enableGeoTIFFTileSource(OpenSeadragon, {
+  httpAdapter: { fetch: myFetch, captureErrorBody: true },
+});
+```
+
+It is off by default deliberately. Error bodies routinely carry tokens, internal hostnames and user
+data, and this message reaches your console logs and the `open-failed` event payload, which app code
+may render or forward to telemetry. When enabled, the body is whitespace-collapsed and truncated to
+200 characters.
 
 ## Usage
 The plugin can be used in two ways:
@@ -251,7 +333,10 @@ Conceptually:
 Every component of a pack is normalized: **`stored = (rawSample - offset) / scale`**, so it lands in
 `[0,1]` — or `[-1,1]` when the channel reports `signed`. `scale`/`offset` are per-channel and are
 carried on each pack, so the original measurement is `stored * scale + offset`. RGBA8 packs store raw
-bytes and rely on the GPU normalizing on sample; the same relation holds after that divide.
+bytes and let the sampler's divide by 255 do the normalizing — so a data-mode pack is only chosen as
+RGBA8 when that divide *is* the declared transform (`scale === 255`, `offset === 0`). A channel whose
+`SMinSampleValue`/`SMaxSampleValue` say otherwise goes to RGBA16F even at 8 bits, because the raw byte
+would otherwise contradict the `scale` stamped beside it.
 
 `scale`/`offset` are derived from TIFF tags alone. A usable `SMinSampleValue`/`SMaxSampleValue` pair
 always wins, whatever the sample format; otherwise the container range is used:
@@ -339,9 +424,11 @@ If `null`, the library packs channels in natural order.
 #### `format.gpu`
 GPU packing options (used when converting to `gpuTextureSet`).
 
-- `preferRGBA8` (boolean, default `true`): If all selected channels are 8-bit unsigned, pack into RGBA8.
-  Sub-byte depths (1/2/4-bit) do **not** qualify even though they arrive in a `Uint8Array` — they go to
-  RGBA16F, where their `scale` is applied exactly.
+- `preferRGBA8` (boolean, default `true`): If all selected channels are 8-bit unsigned *and* normalize
+  by exactly 255, pack into RGBA8. Two kinds of channel do **not** qualify: sub-byte depths (1/2/4-bit,
+  which arrive in a `Uint8Array` all the same) and any channel with a declared
+  `SMinSampleValue`/`SMaxSampleValue` range. Both go to RGBA16F, where their `scale`/`offset` are
+  applied exactly.
 - `forceRGBA16F` (boolean, default `false`): Always pack into RGBA16F (half-float) even if RGBA8 would be possible.
 - `packMode` (`"packsOf4"`, default `"packsOf4"`): Pack channels into RGBA textures in groups of 4.
 - `padAlpha` (number, default `1`): Unit value written into the alpha lane of a pack that has no fourth

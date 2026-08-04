@@ -1,5 +1,6 @@
 import path from "path";
 import { defineConfig } from "vite";
+import { configDefaults } from "vitest/config";
 import license from "rollup-plugin-license";
 import { playwright } from "@vitest/browser-playwright";
 
@@ -80,9 +81,11 @@ export default defineConfig(({ mode }) => {
               instances: [{ browser: "chromium" }],
             },
             // Everything except the jsdom-only layout suite, so a new test file is not
-            // silently skipped by an out-of-date list.
+            // silently skipped by an out-of-date list. Spread the defaults back in:
+            // assigning `exclude` REPLACES them, which would put node_modules and the
+            // committed dist/ back in scope.
             include: ["test/**/*.test.js"],
-            exclude: ["test/pyramid-layout.test.js"],
+            exclude: [...configDefaults.exclude, "test/pyramid-layout.test.js"],
           },
         },
       ],

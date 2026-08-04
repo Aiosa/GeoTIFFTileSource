@@ -12,6 +12,8 @@
  * by the tile source, so decoder and client cannot disagree about the same file.
  */
 
+import { logOnce } from "./consoleOnce.js";
+
 /** Version stamped on every produced texture set. Bump only on a contract change. */
 export const SAMPLE_ENCODING_VERSION = 1;
 
@@ -238,11 +240,30 @@ export function resolveSampleEncoding(desc) {
   return { version: SAMPLE_ENCODING_VERSION, channels };
 }
 
-/** Encoding of a channel, falling back to the first one for short descriptors. */
+/** The transform that changes nothing, used when no channel can be named. */
+const IDENTITY_CHANNEL = Object.freeze({
+  scale: 1, offset: 0, signed: false, bits: 8, sampleFormat: SAMPLE_FORMAT.UINT,
+});
+
+/**
+ * Encoding of one channel.
+ *
+ * An index the descriptor does not cover means a caller named a band the file does not
+ * have -- a bad `format.channels`, most often. Substituting another channel's transform
+ * would normalize that band against the wrong range and say nothing about it, so the
+ * identity transform is returned and the mismatch reported once.
+ */
 export function channelEncodingAt(encoding, index) {
   const channels = (encoding && encoding.channels) || [];
-  if (!channels.length) return { scale: 1, offset: 0, signed: false, bits: 8, sampleFormat: 1 };
-  return channels[index] != null ? channels[index] : channels[0];
+  const ch = channels[index];
+  if (ch != null) return ch;
+
+  logOnce(
+    `tiffEncoding_channel_${index}_of_${channels.length}`,
+    `[RawTiffPlugin] No sample encoding for channel ${index} (file declares ${channels.length}); ` +
+    "using an identity transform. Check format.channels against the file's SamplesPerPixel."
+  );
+  return IDENTITY_CHANNEL;
 }
 
 /**
@@ -272,10 +293,28 @@ export function sampleToByte(value, ch) {
   return Math.round(unit * 255);
 }
 
-/** True when the channel is a plain 8-bit integer, i.e. already display-ready. */
+/**
+ * True when the channel is a plain 8-bit integer, i.e. an 8-bit RGBA buffer can hold it
+ * without destroying anything. This is a question about BIT DEPTH only -- it decides
+ * image-vs-data interpretation, not whether the bytes may be used as-is.
+ */
 export function isDisplayReadyChannel(ch) {
   return ch.bits === 8 &&
     (ch.sampleFormat === SAMPLE_FORMAT.UINT || ch.sampleFormat === SAMPLE_FORMAT.INT);
+}
+
+/**
+ * True when normalizing the channel is a no-op at 8-bit precision: the raw byte already
+ * IS the display byte, and dividing it by 255 already IS the declared transform.
+ *
+ * Stricter than {@link isDisplayReadyChannel} on purpose. An 8-bit channel that declares
+ * `SMinSampleValue`/`SMaxSampleValue` is still shallow enough for the image path, but its
+ * bytes must be rescaled on the way -- and it must not reach an RGBA8 texture, whose
+ * sampler divides by 255 no matter what scale the pack claims.
+ */
+export function isIdentityChannel(ch) {
+  return ch.bits === 8 && ch.sampleFormat === SAMPLE_FORMAT.UINT &&
+    ch.scale === 255 && ch.offset === 0;
 }
 
 /**
